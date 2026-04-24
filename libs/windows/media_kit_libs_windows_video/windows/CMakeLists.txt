@@ -12,17 +12,6 @@ option(MEDIA_KIT_LIBS_AVAILABLE "package:media_kit libraries are available." ON)
 set(PROJECT_NAME "media_kit_libs_windows_video")
 project(${PROJECT_NAME} LANGUAGES CXX)
 
-get_filename_component(
-  MPV_BUILD_WORKSPACE_ROOT
-  "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.."
-  REALPATH
-)
-set(MPV_LOCAL_ROOT "${MPV_BUILD_WORKSPACE_ROOT}/mpv")
-set(MPV_LOCAL_BUILD_DIR "${MPV_LOCAL_ROOT}/build")
-set(MPV_LOCAL_INCLUDE_DIR "${MPV_LOCAL_ROOT}/include")
-set(MPV_LOCAL_DLL "${MPV_LOCAL_BUILD_DIR}/libmpv-2.dll")
-set(MPV_LOCAL_IMPORT_LIB "${MPV_LOCAL_BUILD_DIR}/libmpv.dll.a")
-
 # Deal with MSVC incompatiblity
 add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
 
@@ -85,45 +74,27 @@ set(LIBMPV_SHA256 "3dfc25588540346f650dd17d3220648bf1235420b754d63cc1e3b7dad450a
 set(LIBMPV_ARCHIVE "${CMAKE_BINARY_DIR}/${LIBMPV}")
 set(LIBMPV_SRC "${CMAKE_BINARY_DIR}/libmpv")
 
-set(LIBMPV_STAGE_TARGET "${PROJECT_NAME}_LIBMPV_STAGE")
+download_and_verify(
+  ${LIBMPV_URL}
+  ${LIBMPV_SHA256}
+  ${LIBMPV_ARCHIVE}
+)
 
-if(EXISTS "${MPV_LOCAL_DLL}" AND
-   EXISTS "${MPV_LOCAL_IMPORT_LIB}" AND
-   EXISTS "${MPV_LOCAL_INCLUDE_DIR}/mpv/client.h")
-  message(STATUS "Using local libmpv from ${MPV_LOCAL_BUILD_DIR}.")
-  add_custom_target(
-    "${LIBMPV_STAGE_TARGET}" ALL
-    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${LIBMPV_SRC}/include"
-    COMMAND "${CMAKE_COMMAND}" -E make_directory "${LIBMPV_SRC}/include"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MPV_LOCAL_DLL}" "${LIBMPV_SRC}/libmpv-2.dll"
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MPV_LOCAL_IMPORT_LIB}" "${LIBMPV_SRC}/libmpv.dll.a"
-    COMMAND "${CMAKE_COMMAND}" -E copy_directory "${MPV_LOCAL_INCLUDE_DIR}/mpv" "${LIBMPV_SRC}/include"
-    COMMENT "Staging local libmpv artifacts"
+check_directory_exists_and_not_empty(${LIBMPV_SRC} LIBMPV_SRC_VALID)
+
+# Extract the libmpv archive.
+if(NOT LIBMPV_SRC_VALID)
+  message(STATUS "Extracting ${LIBMPV}...")
+  make_directory("${LIBMPV_SRC}")
+  add_custom_target("${PROJECT_NAME}_LIBMPV_EXTRACT" ALL)
+  add_custom_command(
+    TARGET "${PROJECT_NAME}_LIBMPV_EXTRACT"
+    COMMAND "${CMAKE_COMMAND}" -E tar xzf "\"${LIBMPV_ARCHIVE}\""
+    COMMAND xcopy "\"${LIBMPV_SRC}/include/mpv\"" "\"${LIBMPV_SRC}/mpv\"" /E /H /C /I
+    COMMAND rmdir "\"${LIBMPV_SRC}/include\"" /S /Q
+    COMMAND ren "\"${LIBMPV_SRC}/mpv\"" "\"include\""
+    WORKING_DIRECTORY "${LIBMPV_SRC}"
   )
-else()
-  download_and_verify(
-    ${LIBMPV_URL}
-    ${LIBMPV_SHA256}
-    ${LIBMPV_ARCHIVE}
-  )
-
-  check_directory_exists_and_not_empty(${LIBMPV_SRC} LIBMPV_SRC_VALID)
-
-  # Extract the libmpv archive.
-  if(NOT LIBMPV_SRC_VALID)
-    message(STATUS "Extracting ${LIBMPV}...")
-    add_custom_target(
-      "${LIBMPV_STAGE_TARGET}" ALL
-      COMMAND "${CMAKE_COMMAND}" -E rm -rf "${LIBMPV_SRC}"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory "${LIBMPV_SRC}"
-      COMMAND "${CMAKE_COMMAND}" -E tar xf "${LIBMPV_ARCHIVE}"
-      COMMAND xcopy "${LIBMPV_SRC}/include/mpv" "${LIBMPV_SRC}/mpv" /E /H /C /I /Y
-      COMMAND rmdir "${LIBMPV_SRC}/include" /S /Q
-      COMMAND ren "${LIBMPV_SRC}/mpv" "include"
-      WORKING_DIRECTORY "${LIBMPV_SRC}"
-      COMMENT "Extracting bundled libmpv archive"
-    )
-  endif()
 endif()
 
 # ------------------------------------------------------------------------------
@@ -134,10 +105,6 @@ add_library(
   "include/media_kit_libs_windows_video/media_kit_libs_windows_video_plugin_c_api.h"
   "media_kit_libs_windows_video_plugin_c_api.cpp"
 )
-
-if(TARGET "${LIBMPV_STAGE_TARGET}")
-  add_dependencies(${PLUGIN_NAME} "${LIBMPV_STAGE_TARGET}")
-endif()
 
 apply_standard_settings(${PLUGIN_NAME})
 
