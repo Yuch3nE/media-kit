@@ -12,8 +12,10 @@
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_5.h>
 #include <wrl.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <iostream>
@@ -37,7 +39,7 @@ class D3D11Renderer {
 
   ~D3D11Renderer();
 
-  void SetSize(int32_t width, int32_t height);
+  bool SetSize(int32_t width, int32_t height);
 
   void CopyTexture();
 
@@ -60,8 +62,21 @@ class D3D11Renderer {
   ID3D11DeviceContext* d3d_11_device_context_ = nullptr;
   IDXGISwapChain* swap_chain_ = nullptr;
 
-  // Shared texture for Flutter rendering (created from swap chain back buffer)
-  Microsoft::WRL::ComPtr<ID3D11Texture2D> shared_texture_;
+  // GPU completion fence used to synchronize the per-frame CopyResource on
+  // this device with the consumer (Flutter Engine) device. Without it, the
+  // legacy D3D11_RESOURCE_MISC_SHARED handle has no implicit cross-device
+  // synchronization and the consumer can sample a partially written texture,
+  // producing block-shaped tearing / flicker.
+  Microsoft::WRL::ComPtr<ID3D11Query> copy_complete_query_;
+
+  struct SharedTextureBuffer {
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    HANDLE handle = nullptr;
+  };
+
+  static constexpr size_t kSharedTextureBufferCount = 3;
+  std::array<SharedTextureBuffer, kSharedTextureBufferCount> shared_textures_;
+  size_t active_shared_texture_index_ = 0;
 
   static int instance_count_;
 };
