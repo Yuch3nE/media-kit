@@ -16,7 +16,7 @@ void VideoOutputManager::Create(
     int64_t handle,
     VideoOutputConfiguration configuration,
     std::function<void(int64_t, int64_t, int64_t)> texture_update_callback) {
-  std::thread([=]() {
+  mgmt_thread_pool_->Post([=]() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (video_outputs_.find(handle) == video_outputs_.end()) {
       auto instance = std::make_unique<VideoOutput>(
@@ -24,27 +24,26 @@ void VideoOutputManager::Create(
       instance->SetTextureUpdateCallback(texture_update_callback);
       video_outputs_.insert(std::make_pair(handle, std::move(instance)));
     }
-  }).detach();
+  });
 }
 
 void VideoOutputManager::SetSize(int64_t handle,
                                  std::optional<int64_t> width,
                                  std::optional<int64_t> height) {
-  std::thread([=]() {
+  mgmt_thread_pool_->Post([=]() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (video_outputs_.find(handle) != video_outputs_.end()) {
-      video_outputs_[handle]->SetSize(width, height);
+    auto it = video_outputs_.find(handle);
+    if (it != video_outputs_.end()) {
+      it->second->SetSize(width, height);
     }
-  }).detach();
+  });
 }
 
 void VideoOutputManager::Dispose(int64_t handle) {
-  std::thread([=]() {
+  mgmt_thread_pool_->Post([=]() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (video_outputs_.find(handle) != video_outputs_.end()) {
-      video_outputs_.erase(handle);
-    }
-  }).detach();
+    video_outputs_.erase(handle);
+  });
 }
 
 VideoOutputManager::~VideoOutputManager() {

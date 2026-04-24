@@ -76,6 +76,14 @@ class VideoOutputManager {
   // that all the posted tasks are performed on a single thread orderly. This
   // also makes usage of any |std::mutex| unnecessary (for the good).
   std::unique_ptr<ThreadPool> thread_pool_ = std::make_unique<ThreadPool>(1);
+  // Dedicated single-worker pool used to serialize |Create| / |SetSize| /
+  // |Dispose| platform-channel requests. Using a dedicated pool (instead of
+  // |thread_pool_|) avoids deadlocks: |VideoOutput|'s constructor blocks on
+  // |thread_pool_->Post(..).wait()|, so management tasks must not share that
+  // worker. Using a single worker also implicitly serialises management ops,
+  // making |mutex_| effectively redundant against itself.
+  std::unique_ptr<ThreadPool> mgmt_thread_pool_ =
+      std::make_unique<ThreadPool>(1);
   flutter::PluginRegistrarWindows* registrar_ = nullptr;
   std::unordered_map<int64_t, std::unique_ptr<VideoOutput>> video_outputs_ = {};
 };

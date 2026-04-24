@@ -125,11 +125,9 @@ VideoOutput::~VideoOutput() {
   if (texture_id_) {
     registrar_->texture_registrar()->UnregisterTexture(
         texture_id_, [&, texture_id = texture_id_]() {
-          auto future = thread_pool_ref_->Post([&, id = texture_id]() {
+          thread_pool_ref_->Post([&, id = texture_id]() {
             std::cout << "media_kit: VideoOutput: Free Texture: " << id
                       << std::endl;
-            std::cout << "VideoOutput::~VideoOutput: "
-                      << reinterpret_cast<int64_t>(handle_) << std::endl;
             std::lock_guard<std::mutex> lock(textures_mutex_);
             texture_variants_.clear();
             // H/W
@@ -141,13 +139,28 @@ VideoOutput::~VideoOutput() {
             promise.set_value();
           });
         });
+  } else {
+    // No Flutter texture was ever registered; release resources directly on
+    // the worker thread to keep the same ordering guarantees with the render
+    // thread, while avoiding a deadlock on |promise| (the previous code path
+    // skipped |set_value| entirely when |texture_id_| was 0).
+    thread_pool_ref_->Post([&]() {
+      std::lock_guard<std::mutex> lock(textures_mutex_);
+      texture_variants_.clear();
+      textures_.clear();
+      pixel_buffer_textures_.clear();
+      d3d11_renderer_.reset(nullptr);
+      promise.set_value();
+    });
   }
 
   promise.get_future().wait();
   texture_id_ = 0;
 
   thread_pool_ref_->Post([render_context = render_context_]() {
-    mpv_render_context_free(render_context);
+    if (render_context != nullptr) {
+      mpv_render_context_free(render_context);
+    }
   });
 }
 
@@ -259,8 +272,72 @@ void VideoOutput::CheckAndResize() {
 }
 
 void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
-  std::cout << required_width << " " << required_height << std::endl;
-  // Unregister previously registered texture & delete underlying objects.
+  // H/W: keep the registered Flutter texture and only resize the underlying
+  // D3D11 swap chain / shared textures. The GpuSurfaceTexture descriptor
+  // callback dynamically returns the latest handle/size on every frame, so
+  // there is no need to unregister and re-register the Flutter texture on
+  // every resolution change. Re-registration would otherwise force the engine
+  // to drop and re-bind the texture, causing a visible black flash and extra
+  // GPU work.
+  if (d3d11_renderer_ != nullptr) {
+    d3d11_renderer_->SetSize(static_cast<int32_t>(required_width),
+                             static_cast<int32_t>(required_height));
+
+    const auto actual_width = d3d11_renderer_->width();
+    const auto actual_height = d3d11_renderer_->height();
+
+    if (texture_id_ == 0) {
+      auto texture = std::make_unique<FlutterDesktopGpuSurfaceDescriptor>();
+      texture->struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
+      texture->handle = d3d11_renderer_->handle();
+      texture->width = texture->visible_width = actual_width;
+      texture->height = texture->visible_height = actual_height;
+      texture->release_context = nullptr;
+      texture->release_callback = [](void*) {};
+      texture->format = kFlutterDesktopPixelFormatBGRA8888;
+
+      auto texture_variant =
+          std::make_unique<flutter::TextureVariant>(flutter::GpuSurfaceTexture(
+              kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle, [&](auto, auto) {
+                std::lock_guard<std::mutex> lock(textures_mutex_);
+                if (texture_id_) {
+                  auto descriptor = textures_.at(texture_id_).get();
+                  descriptor->handle = d3d11_renderer_->handle();
+                  descriptor->width = descriptor->visible_width =
+                      d3d11_renderer_->width();
+                  descriptor->height = descriptor->visible_height =
+                      d3d11_renderer_->height();
+                  return descriptor;
+                }
+                return (FlutterDesktopGpuSurfaceDescriptor*)nullptr;
+              }));
+      texture_id_ = registrar_->texture_registrar()->RegisterTexture(
+          texture_variant.get());
+      std::cout << "media_kit: VideoOutput: Create Texture: " << texture_id_
+                << " (" << actual_width << "x" << actual_height << ")"
+                << std::endl;
+      {
+        std::lock_guard<std::mutex> lock(textures_mutex_);
+        textures_.emplace(std::make_pair(texture_id_, std::move(texture)));
+        texture_variants_.emplace(
+            std::make_pair(texture_id_, std::move(texture_variant)));
+      }
+    } else {
+      std::lock_guard<std::mutex> lock(textures_mutex_);
+      auto it = textures_.find(texture_id_);
+      if (it != textures_.end()) {
+        auto* descriptor = it->second.get();
+        descriptor->handle = d3d11_renderer_->handle();
+        descriptor->width = descriptor->visible_width = actual_width;
+        descriptor->height = descriptor->visible_height = actual_height;
+      }
+    }
+    texture_update_callback_(texture_id_, actual_width, actual_height);
+    return;
+  }
+
+  // S/W: the pixel buffer dimensions are baked into the descriptor, so we
+  // must unregister and re-create on every resize.
   if (texture_id_) {
     registrar_->texture_registrar()->UnregisterTexture(
         texture_id_, [&, id = texture_id_]() {
@@ -271,67 +348,11 @@ void VideoOutput::Resize(int64_t required_width, int64_t required_height) {
             if (destroyed_) {
               return;
             }
-            if (texture_variants_.find(id) != texture_variants_.end()) {
-              texture_variants_.erase(id);
-            }
-            // H/W
-            if (textures_.find(id) != textures_.end()) {
-              textures_.erase(id);
-            }
-            // S/W
-            if (pixel_buffer_textures_.find(id) !=
-                pixel_buffer_textures_.end()) {
-              pixel_buffer_textures_.erase(id);
-            }
+            texture_variants_.erase(id);
+            pixel_buffer_textures_.erase(id);
           }
         });
     texture_id_ = 0;
-  }
-  // H/W
-  if (d3d11_renderer_ != nullptr) {
-    // Resize the D3D11 texture.
-    d3d11_renderer_->SetSize(static_cast<int32_t>(required_width),
-                             static_cast<int32_t>(required_height));
-
-    auto actual_width = d3d11_renderer_->width();
-    auto actual_height = d3d11_renderer_->height();
-
-    auto texture = std::make_unique<FlutterDesktopGpuSurfaceDescriptor>();
-    texture->struct_size = sizeof(FlutterDesktopGpuSurfaceDescriptor);
-    texture->handle = d3d11_renderer_->handle();
-    texture->width = texture->visible_width = actual_width;
-    texture->height = texture->visible_height = actual_height;
-    texture->release_context = nullptr;
-    texture->release_callback = [](void*) {};
-    texture->format = kFlutterDesktopPixelFormatBGRA8888;
-
-    auto texture_variant =
-        std::make_unique<flutter::TextureVariant>(flutter::GpuSurfaceTexture(
-            kFlutterDesktopGpuSurfaceTypeDxgiSharedHandle, [&](auto, auto) {
-              std::lock_guard<std::mutex> lock(textures_mutex_);
-              if (texture_id_) {
-                auto descriptor = textures_.at(texture_id_).get();
-                descriptor->handle = d3d11_renderer_->handle();
-                descriptor->width = descriptor->visible_width =
-                    d3d11_renderer_->width();
-                descriptor->height = descriptor->visible_height =
-                    d3d11_renderer_->height();
-                return descriptor;
-              } else {
-                return (FlutterDesktopGpuSurfaceDescriptor*)nullptr;
-              }
-            }));
-    // Register new texture.
-    texture_id_ =
-        registrar_->texture_registrar()->RegisterTexture(texture_variant.get());
-    std::cout << "media_kit: VideoOutput: Create Texture: " << texture_id_
-              << std::endl;
-    std::lock_guard<std::mutex> lock(textures_mutex_);
-    textures_.emplace(std::make_pair(texture_id_, std::move(texture)));
-    texture_variants_.emplace(
-        std::make_pair(texture_id_, std::move(texture_variant)));
-    // Notify public texture update callback.
-    texture_update_callback_(texture_id_, actual_width, actual_height);
   }
   // S/W
   if (pixel_buffer_ != nullptr) {
