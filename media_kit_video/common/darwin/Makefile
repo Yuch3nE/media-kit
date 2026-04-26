@@ -3,8 +3,10 @@ HEADERS_DESTDIR_ESCAPED=$(subst $(SPACE),\ ,${HEADERS_DESTDIR})
 
 all: ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h
 
-MPV_HEADERS_VERSION=v0.36.0
-MPV_HEADERS_SHA256SUM=29abc44f8ebee013bb2f9fe14d80b30db19b534c679056e4851ceadf5a5e8bf6
+MPV_HEADERS_REPOSITORY?=Yuch3nE/mpv
+MPV_HEADERS_VERSION?=v0.41.0.patch-gpu-next
+MPV_HEADERS_SHA256SUM?=
+MPV_HEADERS_URL?=https://github.com/${MPV_HEADERS_REPOSITORY}/archive/refs/tags/${MPV_HEADERS_VERSION}.tar.gz
 
 TAR=tar
 TAR_WILDCARDS_FLAG := $(shell ${TAR} --version 2>&1 | grep -q 'GNU' && echo "--wildcards" || echo "")
@@ -12,10 +14,12 @@ TAR_WILDCARDS_FLAG := $(shell ${TAR} --version 2>&1 | grep -q 'GNU' && echo "--w
 .cache/headers/mpv-${MPV_HEADERS_VERSION}.tar.gz:
 	mkdir -p .cache/headers
 	rm -f .cache/headers/*.tmp .cache/headers/*.tar.gz
-	curl -L \
-		https://github.com/mpv-player/mpv/archive/refs/tags/${MPV_HEADERS_VERSION}.tar.gz \
-		-o .cache/headers/mpv.tar.gz.tmp
-	shasum -a 256 -c <<< '${MPV_HEADERS_SHA256SUM}  .cache/headers/mpv.tar.gz.tmp'
+	curl -L "${MPV_HEADERS_URL}" -o .cache/headers/mpv.tar.gz.tmp
+	if [ -n "${MPV_HEADERS_SHA256SUM}" ]; then \
+		printf '%s  %s\n' '${MPV_HEADERS_SHA256SUM}' '.cache/headers/mpv.tar.gz.tmp' | shasum -a 256 -c -; \
+	else \
+		echo 'Skipping SHA256 verification because MPV_HEADERS_SHA256SUM is empty.'; \
+	fi
 	mv .cache/headers/mpv.tar.gz.tmp .cache/headers/mpv-${MPV_HEADERS_VERSION}.tar.gz
 	touch .cache/headers/mpv-${MPV_HEADERS_VERSION}.tar.gz
 
@@ -26,4 +30,5 @@ TAR_WILDCARDS_FLAG := $(shell ${TAR} --version 2>&1 | grep -q 'GNU' && echo "--w
 ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h: .cache/headers/mpv.tar.gz
 	mkdir -p ${HEADERS_DESTDIR_ESCAPED}/mpv
 	${TAR} ${TAR_WILDCARDS_FLAG} -xvf .cache/headers/mpv.tar.gz --strip-components 2 -C ${HEADERS_DESTDIR_ESCAPED}/mpv/ 'mpv-*/libmpv/*.h'
+	perl -0pi -e 's/(\n[[:space:]]*} mpv_render_param_type;)/\n    MPV_RENDER_PARAM_BACKEND = 21,\1/ if !/MPV_RENDER_PARAM_BACKEND/' ${HEADERS_DESTDIR_ESCAPED}/mpv/render.h
 	touch ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h

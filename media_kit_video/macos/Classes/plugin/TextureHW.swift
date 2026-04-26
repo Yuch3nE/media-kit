@@ -63,6 +63,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     let api = UnsafeMutableRawPointer(
       mutating: (MPV_RENDER_API_TYPE_OPENGL as NSString).utf8String
     )
+    let backend = UnsafeMutableRawPointer(
+      mutating: ("gpu-next" as NSString).utf8String
+    )
     var procAddress = mpv_opengl_init_params(
       get_proc_address: {
         (ctx, name) in
@@ -75,6 +78,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       procAddress in
       return [
         mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE, data: api),
+        mpv_render_param(type: MPV_RENDER_PARAM_BACKEND, data: backend),
         mpv_render_param(
           type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
           data: procAddress.baseAddress.map {
