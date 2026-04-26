@@ -29,6 +29,13 @@ TAR_WILDCARDS_FLAG := $(shell ${TAR} --version 2>&1 | grep -q 'GNU' && echo "--w
 
 ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h: .cache/headers/mpv.tar.gz
 	mkdir -p ${HEADERS_DESTDIR_ESCAPED}/mpv
-	${TAR} ${TAR_WILDCARDS_FLAG} -xvf .cache/headers/mpv.tar.gz --strip-components 2 -C ${HEADERS_DESTDIR_ESCAPED}/mpv/ 'mpv-*/libmpv/*.h'
+	if ${TAR} -tzf .cache/headers/mpv.tar.gz | grep -qE '^mpv-[^/]+/include/mpv/client\.h$$'; then \
+		HEADER_GLOB='mpv-*/include/mpv/*.h'; \
+		STRIP_COMPONENTS=3; \
+	else \
+		HEADER_GLOB='mpv-*/libmpv/*.h'; \
+		STRIP_COMPONENTS=2; \
+	fi; \
+	${TAR} ${TAR_WILDCARDS_FLAG} -xvf .cache/headers/mpv.tar.gz --strip-components $$STRIP_COMPONENTS -C ${HEADERS_DESTDIR_ESCAPED}/mpv/ "$$HEADER_GLOB"
 	perl -0pi -e 's/(\n[[:space:]]*} mpv_render_param_type;)/\n    MPV_RENDER_PARAM_BACKEND = 21,\1/ if !/MPV_RENDER_PARAM_BACKEND/' ${HEADERS_DESTDIR_ESCAPED}/mpv/render.h
 	touch ${HEADERS_DESTDIR_ESCAPED}/mpv/*.h
