@@ -152,6 +152,14 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   private func disposePixelBuffer() {
     textureContexts.reinit(objects: [], skipCheckArgs: true)
+
+    // `glDeleteTextures` alone does not release the IOSurface backing the
+    // CVOpenGLTexture; the texture cache keeps an internal reference until
+    // it is flushed. Without this call, every resize accumulates retained
+    // IOSurfaces until the cache itself is destroyed.
+    CGLSetCurrentContext(context)
+    CVOpenGLTextureCacheFlush(textureCache, 0)
+    CGLSetCurrentContext(nil)
   }
 
   public func render(_ size: CGSize) {
