@@ -30,11 +30,45 @@ Pod::Spec.new do |s|
   if mku.libs_found
     # Define paths to frameworks dir
     framework_search_paths_macosx = sprintf('$(PROJECT_DIR)/../Flutter/ephemeral/.symlinks/plugins/%s/macos/Frameworks/.symlinks/mpv/macos', mku.libs_package)
+    source_files = [
+      'Classes/plugin/common/**/*.swift',
+      'Classes/plugin/gl/**/*.swift',
+      'Classes/plugin/TextureHW.swift',
+      'Classes/plugin/Utils.swift',
+      'Headers/**/*.h',
+    ]
+    public_header_files = ['Headers/**/*.h']
+    swift_flags = ['$(inherited)']
 
-    s.source_files        = 'Classes/plugin/**/*.swift',
-                            '../common/darwin/Classes/plugin/vulkan/*.{h,mm}',
-                            'Headers/**/*.h'
-    s.public_header_files = '../common/darwin/Classes/plugin/vulkan/*.h'
+    vulkan_sdk_prefix = [
+      ENV['VULKAN_SDK_PREFIX'],
+      '/opt/homebrew',
+      '/usr/local',
+    ].compact.find do |prefix|
+      File.exist?(File.join(prefix, 'include', 'vulkan', 'vulkan.h'))
+    end
+
+    if vulkan_sdk_prefix
+      source_files += [
+        'Classes/plugin/TextureVK.swift',
+        'Classes/plugin/vulkan/MediaKitVulkanShim.h',
+        'Classes/plugin/vulkan/MediaKitVulkanShim.mm',
+      ]
+      public_header_files += ['Classes/plugin/vulkan/MediaKitVulkanShim.h']
+      swift_flags << '-DMEDIA_KIT_ENABLE_VULKAN'
+    end
+
+    header_search_paths = ['"$(inherited)"']
+    library_search_paths = ['"$(inherited)"']
+    if vulkan_sdk_prefix
+      header_search_paths << "\"#{vulkan_sdk_prefix}/include\""
+      library_search_paths << "\"#{vulkan_sdk_prefix}/lib\""
+    end
+    header_search_paths += ['"/opt/homebrew/include"', '"/usr/local/include"']
+    library_search_paths += ['"/opt/homebrew/lib"', '"/usr/local/lib"']
+
+    s.source_files = source_files
+    s.public_header_files = public_header_files
     s.private_header_files = []
     s.libraries           = ['c++']
     s.weak_frameworks     = ['Metal', 'QuartzCore']
@@ -44,12 +78,10 @@ Pod::Spec.new do |s|
       'GCC_WARN_INHIBIT_ALL_WARNINGS'       => 'YES',
       'GCC_PREPROCESSOR_DEFINITIONS'        => '"$(inherited)" GL_SILENCE_DEPRECATION COREVIDEO_SILENCE_GL_DEPRECATION VK_USE_PLATFORM_METAL_EXT=1',
       'FRAMEWORK_SEARCH_PATHS[sdk=macosx*]' => sprintf('"$(inherited)" "%s"', framework_search_paths_macosx),
-      # MoltenVK / Vulkan loader headers + libs are expected from Homebrew or
-      # an env-provided SDK. Allow override via the VULKAN_SDK_PREFIX user
-      # build setting; otherwise probe common Homebrew locations.
-      'HEADER_SEARCH_PATHS'                 => '"$(inherited)" "$(VULKAN_SDK_PREFIX)/include" "/opt/homebrew/include" "/usr/local/include"',
-      'LIBRARY_SEARCH_PATHS'                => '"$(inherited)" "$(VULKAN_SDK_PREFIX)/lib" "/opt/homebrew/lib" "/usr/local/lib"',
+      'HEADER_SEARCH_PATHS'                 => header_search_paths.join(' '),
+      'LIBRARY_SEARCH_PATHS'                => library_search_paths.join(' '),
       'OTHER_LDFLAGS'                       => '"$(inherited)" -framework Mpv',
+      'OTHER_SWIFT_FLAGS'                   => swift_flags.join(' '),
     }
   else
     s.source_files        = 'Classes/stub/**/*.swift'

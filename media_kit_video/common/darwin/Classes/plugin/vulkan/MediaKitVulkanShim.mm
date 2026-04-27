@@ -32,6 +32,10 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_metal.h>
 
+#ifndef VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME
+#define VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME "VK_KHR_portability_subset"
+#endif
+
 #include "MediaKitVulkanShim.h"
 
 #include <mutex>
@@ -52,18 +56,52 @@ namespace {
     } while (0)
 
 PFN_vkGetInstanceProcAddr resolve_loader() {
-    // Try the system loader (libvulkan.dylib) first; fall back to libMoltenVK
-    // shipped alongside the host bundle.
+    // Search order:
+    //   1. App-bundle copies (so the app is self-contained and does not
+    //      depend on a system / Homebrew install at runtime).
+    //   2. The Vulkan loader framework media_kit_libs_macos_video already
+    //      ships in the bundle (still requires an ICD on disk; will fail
+    //      with -9 if MoltenVK is not bundled, in which case we keep
+    //      walking).
+    //   3. Common system / Homebrew install paths as a last-resort fallback
+    //      for development setups.
     static const char *candidates[] = {
+        // 1. Bundled MoltenVK (preferred)
+        "@executable_path/../Frameworks/libMoltenVK.dylib",
+        "@loader_path/../Frameworks/libMoltenVK.dylib",
+        "@executable_path/../Frameworks/libvulkan.dylib",
+        "@executable_path/../Frameworks/libvulkan.1.dylib",
+        // 2. Bundled Vulkan loader framework
+        "@executable_path/../Frameworks/Vulkan.framework/Vulkan",
+        "@loader_path/../Frameworks/Vulkan.framework/Vulkan",
+        // 3. System / Homebrew (development fallback only)
+        "libMoltenVK.dylib",
         "libvulkan.dylib",
         "libvulkan.1.dylib",
-        "libMoltenVK.dylib",
+        "/opt/homebrew/opt/molten-vk/lib/libMoltenVK.dylib",
+        "/opt/homebrew/lib/libMoltenVK.dylib",
+        "/usr/local/opt/molten-vk/lib/libMoltenVK.dylib",
+        "/usr/local/lib/libMoltenVK.dylib",
+        "/opt/homebrew/lib/libvulkan.dylib",
+        "/opt/homebrew/lib/libvulkan.1.dylib",
+        "/opt/homebrew/opt/vulkan-loader/lib/libvulkan.dylib",
+        "/usr/local/lib/libvulkan.dylib",
+        "/usr/local/lib/libvulkan.1.dylib",
+        "/usr/local/opt/vulkan-loader/lib/libvulkan.dylib",
         nullptr,
     };
     for (int i = 0; candidates[i]; i++) {
         void *handle = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
-        if (!handle)
+        if (!handle) {
+            const char *err = dlerror();
+            if (err && strstr(candidates[i], "@") == nullptr &&
+                strstr(candidates[i], "/") != nullptr) {
+                // Only log absolute / explicit paths so the noisy bundle
+                // probes do not spam.
+                MK_VK_LOG(@"dlopen(%s) failed: %s", candidates[i], err);
+            }
             continue;
+        }
         auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
             dlsym(handle, "vkGetInstanceProcAddr"));
         if (fn) {
@@ -72,7 +110,7 @@ PFN_vkGetInstanceProcAddr resolve_loader() {
         }
         dlclose(handle);
     }
-    MK_VK_LOG(@"No Vulkan loader found (tried libvulkan / libMoltenVK).");
+    MK_VK_LOG(@"No Vulkan loader found (tried bundle, libvulkan, libMoltenVK).");
     return nullptr;
 }
 
@@ -90,7 +128,7 @@ struct MKVulkanContext {
     VkCommandPool    pool     = VK_NULL_HANDLE;
 
     VkPhysicalDeviceFeatures2 features2{};
-    VkPhysicalDeviceTimelineSemaphoreFeatures timeline{};
+    VkPhysicalDeviceVulkan12Features vulkan12{};
 
     bool has_timeline_semaphore = false;
     bool has_metal_objects = false;
@@ -100,6 +138,7 @@ struct MKVulkanContext {
 
 #define VK_FN(name) PFN_##name name = nullptr
     VK_FN(vkCreateInstance);
+    VK_FN(vkEnumerateInstanceExtensionProperties);
     VK_FN(vkDestroyInstance);
     VK_FN(vkEnumeratePhysicalDevices);
     VK_FN(vkGetPhysicalDeviceProperties);
@@ -146,7 +185,11 @@ namespace {
 bool load_global_fns(MKVulkanContext *c) {
     c->vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(
         c->gipa(VK_NULL_HANDLE, "vkCreateInstance"));
-    return c->vkCreateInstance != nullptr;
+    c->vkEnumerateInstanceExtensionProperties =
+        reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            c->gipa(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+    return c->vkCreateInstance != nullptr &&
+           c->vkEnumerateInstanceExtensionProperties != nullptr;
 }
 
 bool load_instance_fns(MKVulkanContext *c) {
@@ -182,13 +225,33 @@ bool load_instance_fns(MKVulkanContext *c) {
 }
 
 bool create_instance(MKVulkanContext *c) {
-    static const char *kInstanceExts[] = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_EXT_METAL_SURFACE_EXTENSION_NAME,
-        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
-        VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
+    uint32_t ext_count = 0;
+    c->vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, nullptr);
+    std::vector<VkExtensionProperties> ext_props(ext_count);
+    if (ext_count > 0) {
+        c->vkEnumerateInstanceExtensionProperties(
+            nullptr,
+            &ext_count,
+            ext_props.data());
+    }
+
+    auto has_instance_ext = [&](const char *want) {
+        for (const auto &ext : ext_props) {
+            if (strcmp(ext.extensionName, want) == 0) {
+                return true;
+            }
+        }
+        return false;
     };
+
+    std::vector<const char *> instance_exts;
+    if (has_instance_ext(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+        instance_exts.push_back(
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    }
+    if (has_instance_ext(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        instance_exts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+    }
 
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -197,10 +260,12 @@ bool create_instance(MKVulkanContext *c) {
 
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    if (has_instance_ext(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = sizeof(kInstanceExts) / sizeof(kInstanceExts[0]);
-    ici.ppEnabledExtensionNames = kInstanceExts;
+    ici.enabledExtensionCount = static_cast<uint32_t>(instance_exts.size());
+    ici.ppEnabledExtensionNames = instance_exts.data();
 
     VkResult rc = c->vkCreateInstance(&ici, nullptr, &c->instance);
     if (rc != VK_SUCCESS) {
@@ -220,6 +285,8 @@ bool pick_physical_device(MKVulkanContext *c) {
     c->vkEnumeratePhysicalDevices(c->instance, &n, devs.data());
 
     for (auto pd : devs) {
+        VkPhysicalDeviceProperties props{};
+        c->vkGetPhysicalDeviceProperties(pd, &props);
         uint32_t qfn = 0;
         c->vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qfn);
@@ -231,6 +298,12 @@ bool pick_physical_device(MKVulkanContext *c) {
                 c->phys = pd;
                 c->qf_index = i;
                 c->qf_count = 1;
+                MK_VK_LOG(@"Picked device '%s' apiVersion=%u.%u.%u qf=%u",
+                          props.deviceName,
+                          VK_API_VERSION_MAJOR(props.apiVersion),
+                          VK_API_VERSION_MINOR(props.apiVersion),
+                          VK_API_VERSION_PATCH(props.apiVersion),
+                          i);
                 return true;
             }
         }
@@ -269,7 +342,7 @@ bool create_device(MKVulkanContext *c) {
         VK_KHR_MAINTENANCE3_EXTENSION_NAME,
         VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
     };
-    for (auto e : kWanted) {
+    for (const char *e : kWanted) {
         if (has(e)) {
             c->dev_exts.push_back(e);
             if (strcmp(e, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0)
@@ -280,20 +353,23 @@ bool create_device(MKVulkanContext *c) {
     }
 
     // Query features once and pass them straight through to libmpv. libplacebo
-    // requires features2. Add timelineSemaphore = TRUE when the extension is
-    // present so we can use MTLSharedEvent-backed timeline semaphores for
-    // async cross-API sync.
+    // requires the exact enabled feature chain. In practice on MoltenVK this
+    // needs Vulkan 1.2 features so hostQueryReset is visible and enabled.
     c->features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    c->timeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-    if (c->has_timeline_semaphore) {
-        c->features2.pNext = &c->timeline;
-    }
+    c->vulkan12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    c->features2.pNext = &c->vulkan12;
     c->vkGetPhysicalDeviceFeatures2(c->phys, &c->features2);
-    if (c->has_timeline_semaphore && !c->timeline.timelineSemaphore) {
+
+    if (!c->vulkan12.hostQueryReset) {
+        MK_VK_LOG(@"Device missing required Vulkan feature: hostQueryReset");
+        return false;
+    }
+
+    if (c->has_timeline_semaphore && !c->vulkan12.timelineSemaphore) {
         // Driver does not actually support timelines despite the extension
         // being listed. Drop our claim so device creation does not assert.
         c->has_timeline_semaphore = false;
-        c->features2.pNext = nullptr;
+        c->vulkan12.timelineSemaphore = VK_FALSE;
     }
 
     float prio = 1.0f;
@@ -314,6 +390,18 @@ bool create_device(MKVulkanContext *c) {
     if (c->vkCreateDevice(c->phys, &dci, nullptr, &c->device) != VK_SUCCESS) {
         MK_VK_LOG(@"vkCreateDevice failed.");
         return false;
+    }
+
+    {
+        NSMutableString *exts = [NSMutableString string];
+        for (size_t i = 0; i < c->dev_exts.size(); i++) {
+            if (i) [exts appendString:@", "];
+            [exts appendFormat:@"%s", c->dev_exts[i]];
+        }
+        MK_VK_LOG(@"VkDevice created (qf=%u, count=%u, ext=%lu, timeline=%d, metal_objects=%d): %@",
+                  c->qf_index, c->qf_count,
+                  (unsigned long)c->dev_exts.size(),
+                  c->has_timeline_semaphore, c->has_metal_objects, exts);
     }
 
     // Per Vulkan spec, device-level entry points should be resolved via
@@ -539,23 +627,13 @@ void mk_vk_semaphore_destroy(MKVulkanContext *c, uint64_t sem) {
 
 void mk_vk_wait_semaphore_blocking(MKVulkanContext *c, uint64_t sem) {
     if (!c || !sem) return;
-    VkSemaphore vsem = (VkSemaphore)(uintptr_t)sem;
 
-    // Submit an empty queue submission that waits on `sem`. Pair with
-    // vkQueueWaitIdle so the host knows the GPU is done. v1 implementation:
-    // simple, blocks the worker thread for <= one frame.
-    VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &vsem;
-    si.pWaitDstStageMask = &stage;
-
-    {
-        std::lock_guard<std::mutex> lk(c->queue_mutex);
-        c->vkQueueSubmit(c->queue, 1, &si, VK_NULL_HANDLE);
-        c->vkQueueWaitIdle(c->queue);
-    }
+    // The imported device currently exposes exactly one queue in the family
+    // handed to mpv. Waiting that queue idle is sufficient to know mpv's
+    // earlier rendering work has completed and avoids an extra wait-only
+    // submission, which can stall indefinitely on MoltenVK.
+    std::lock_guard<std::mutex> lk(c->queue_mutex);
+    c->vkQueueWaitIdle(c->queue);
 }
 
 bool mk_vk_supports_metal_event_sync(MKVulkanContext *c) {

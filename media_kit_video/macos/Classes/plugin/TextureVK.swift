@@ -3,6 +3,8 @@ import Metal
 import CoreVideo
 import AppKit
 
+#if MEDIA_KIT_ENABLE_VULKAN
+
 // TextureVK: macOS FlutterTexture that drives mpv's Vulkan render backend
 // (MPV_RENDER_API_TYPE_VULKAN) over MoltenVK, producing CVPixelBuffer frames
 // for Flutter via an IOSurface-backed MTLTexture.
@@ -24,7 +26,7 @@ import AppKit
 public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol {
     public typealias UpdateCallback = () -> Void
 
-    private struct Slot {
+    fileprivate struct Slot {
         let pixelBuffer: CVPixelBuffer
         let mtlTexture:  MTLTexture
         let vkImage:     OpaquePointer  // MKVulkanImage*
@@ -73,9 +75,9 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
 
     // Wraps Slot in a class so SwappableObjectManager (which expects AnyObject)
     // can hold it.
-    final class SlotBox {
-        let inner: Slot
-        init(_ s: Slot) { self.inner = s }
+    fileprivate final class SlotBox {
+        fileprivate let inner: Slot
+        fileprivate init(_ s: Slot) { self.inner = s }
     }
 
     init?(handle: OpaquePointer, updateCallback: @escaping UpdateCallback) {
@@ -92,19 +94,22 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             NSLog("TextureVK: failed to create Vulkan context (MoltenVK missing?)")
             return nil
         }
-        self.vkContext = OpaquePointer(ctx)
+        self.vkContext = ctx
 
         super.init()
 
         if !initMPV() {
-            mk_vk_context_destroy(UnsafeMutableRawPointer(vkContext)
-                .assumingMemoryBound(to: MKVulkanContext.self))
+            mk_vk_context_destroy(vkContext)
             return nil
         }
-        asyncSyncSupported = mk_vk_supports_metal_event_sync(
-            UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self))
-        if asyncSyncSupported {
-            NSLog("TextureVK: async sync via MTLSharedEvent + Vk timeline enabled.")
+        let reportedAsyncSyncSupport = mk_vk_supports_metal_event_sync(vkContext)
+        // MoltenVK/libplacebo currently reports a usable Vulkan device here,
+        // but the MTLSharedEvent-backed timeline path does not drive the
+        // render loop reliably yet. Keep the simpler blocking semaphore path
+        // until the async interop is validated end-to-end on macOS.
+        asyncSyncSupported = false
+        if reportedAsyncSyncSupport {
+            NSLog("TextureVK: disabling MTLSharedEvent timeline sync on macOS; falling back to vkQueueWaitIdle blocking sync.")
         } else {
             NSLog("TextureVK: falling back to vkQueueWaitIdle blocking sync.")
         }
@@ -119,8 +124,7 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             mpv_render_context_set_update_callback(rc, nil, nil)
             mpv_render_context_free(rc)
         }
-        mk_vk_context_destroy(UnsafeMutableRawPointer(vkContext)
-            .assumingMemoryBound(to: MKVulkanContext.self))
+        mk_vk_context_destroy(vkContext)
     }
 
     // MARK: FlutterTexture
@@ -153,11 +157,21 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         image.height          = box.inner.height
         image.format          = box.inner.format
         image.usage           = box.inner.usage
-        image.aspect          = 0  // default = COLOR
+        // VK_IMAGE_ASPECT_COLOR_BIT = 0x1. Spec allows 0 here, but at least
+        // some libplacebo paths fast-path on a non-zero aspect mask, so be
+        // explicit.
+        image.aspect          = 0x1
         image.in_layout       = 0  // VK_IMAGE_LAYOUT_UNDEFINED
-        image.in_qf           = 0  // VK_QUEUE_FAMILY_IGNORED
+        // VK_QUEUE_FAMILY_EXTERNAL = (~0u - 1) = 0xFFFFFFFE.
+        // The image is backed by an MTLTexture (a non-Vulkan API), so per
+        // render_vk.h we must mark both the inbound and outbound queue
+        // family as EXTERNAL. Without this, MoltenVK does not emit the
+        // ownership-release barrier and the rendered contents never get
+        // flushed back into the underlying IOSurface -> black frame in
+        // Flutter even though every Vulkan call returns success.
+        image.in_qf           = 0xFFFFFFFE
         image.out_layout      = 5  // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        image.out_qf          = 0
+        image.out_qf          = 0xFFFFFFFE
         image.wait_semaphore  = 0
         image.wait_value      = 0
         image.signal_semaphore = box.inner.vkSemaphore
@@ -175,13 +189,24 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         image.surface_max_fall  = 0
 
         var imageMut = image
+        var renderRc: Int32 = 0
         withUnsafeMutablePointer(to: &imageMut) { imgPtr in
             var params: [mpv_render_param] = [
                 mpv_render_param(type: MPV_RENDER_PARAM_VK_IMAGE,
                                  data: UnsafeMutableRawPointer(imgPtr)),
                 mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
             ]
-            mpv_render_context_render(rc, &params)
+            renderRc = mpv_render_context_render(rc, &params)
+        }
+        if renderRc < 0 {
+            // Once-per-second cap on the failure log so a broken pipeline
+            // doesn't drown unified logs.
+            let now = Date().timeIntervalSinceReferenceDate
+            if now - lastRenderFailLogAt > 1.0 {
+                lastRenderFailLogAt = now
+                let errStr = mpv_error_string(renderRc).map { String(cString: $0) } ?? "?"
+                NSLog("TextureVK: mpv_render_context_render rc=\(renderRc) (\(errStr))")
+            }
         }
 
         applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
@@ -192,7 +217,8 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             // mpv signals on the Vk side via timeline semaphore). The worker
             // thread is freed immediately while the slot publishes itself
             // once the GPU is genuinely done.
-            mtlEvent.notify(TextureVK.sharedEventListener, atValue: signalValue) { [weak self] _, _ in
+            mtlEvent.notify(TextureVK.sharedEventListener, atValue: signalValue) {
+                [weak self] (_: MTLSharedEvent, _: UInt64) in
                 guard let self = self else { return }
                 self.slots.pushAsReady(box)
                 // FlutterTextureRegistry / updateCallback consumers expect
@@ -202,13 +228,17 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             }
         } else {
             // Blocking fallback: vkQueueWaitIdle on a tiny submission.
-            mk_vk_wait_semaphore_blocking(
-                UnsafeMutableRawPointer(vkContext)
-                    .assumingMemoryBound(to: MKVulkanContext.self),
-                box.inner.vkSemaphore)
+            mk_vk_wait_semaphore_blocking(vkContext, box.inner.vkSemaphore)
             slots.pushAsReady(box)
+            if !firstFramePublished {
+                firstFramePublished = true
+                NSLog("TextureVK: first frame published (\(box.inner.width)x\(box.inner.height), fmt=\(box.inner.format)).")
+            }
         }
     }
+
+    private var lastRenderFailLogAt: TimeInterval = 0
+    private var firstFramePublished: Bool = false
 
     // MARK: internals
 
@@ -219,20 +249,16 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             mutating: ("gpu-next" as NSString).utf8String)
 
         var devExtCount: size_t = 0
-        let devExtsPtr = mk_vk_context_device_extensions(
-            UnsafeMutableRawPointer(vkContext)
-                .assumingMemoryBound(to: MKVulkanContext.self),
-            &devExtCount)
+        let devExtsPtr = mk_vk_context_device_extensions(vkContext, &devExtCount)
 
         var initParams = mpv_vulkan_init_params(
-            instance:                  mk_vk_context_instance(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            phys_device:               mk_vk_context_phys_device(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            device:                    mk_vk_context_device(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            queue_family_index:        mk_vk_context_queue_family_index(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            queue_index:               0,
-            queue_count:               mk_vk_context_queue_count(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            get_proc_addr:             mk_vk_context_get_proc_addr(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
-            enabled_features:          mk_vk_context_features(UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self)),
+            instance:                  mk_vk_context_instance(vkContext),
+            phys_device:               mk_vk_context_phys_device(vkContext),
+            device:                    mk_vk_context_device(vkContext),
+            queue_family_index:        mk_vk_context_queue_family_index(vkContext),
+            queue_count:               mk_vk_context_queue_count(vkContext),
+            get_proc_addr:             mk_vk_context_get_proc_addr(vkContext),
+            enabled_features:          mk_vk_context_features(vkContext),
             lock_queue:                mk_vk_context_lock_queue,
             unlock_queue:              mk_vk_context_unlock_queue,
             queue_ctx:                 UnsafeMutableRawPointer(vkContext),
@@ -251,7 +277,8 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             ]
             let rc = mpv_render_context_create(&renderContext, handle, &params)
             if rc < 0 {
-                NSLog("TextureVK: mpv_render_context_create failed: \(rc)")
+                let errorText = mpv_error_string(rc).map { String(cString: $0) } ?? "unknown"
+                NSLog("TextureVK: mpv_render_context_create failed: \(rc) (\(errorText))")
                 return false
             }
             mpv_render_context_set_update_callback(
@@ -313,7 +340,7 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         var vkUsage:  UInt32 = 0
         let texPtr = Unmanaged.passUnretained(tex).toOpaque()
         guard let vkImg = mk_vk_image_import_mtl(
-            UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self),
+            vkContext,
             texPtr, UInt32(width), UInt32(height), &vkFormat, &vkUsage)
         else {
             NSLog("TextureVK: mk_vk_image_import_mtl failed.")
@@ -328,25 +355,21 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         if asyncSyncSupported,
            let ev = mtlDevice.makeSharedEvent() {
             let evPtr = Unmanaged.passUnretained(ev).toOpaque()
-            sem = mk_vk_semaphore_import_mtl_event(
-                UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self),
-                evPtr)
+            sem = mk_vk_semaphore_import_mtl_event(vkContext, evPtr)
             if sem != 0 {
                 mtlEvent = ev
             }
         }
         if sem == 0 {
-            sem = mk_vk_semaphore_create(
-                UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self))
+            sem = mk_vk_semaphore_create(vkContext)
         }
         if sem == 0 {
-            mk_vk_image_destroy(UnsafeMutableRawPointer(vkContext)
-                .assumingMemoryBound(to: MKVulkanContext.self), vkImg)
+            mk_vk_image_destroy(vkContext, vkImg)
             return nil
         }
 
         return Slot(pixelBuffer: pixelBuffer, mtlTexture: tex,
-                    vkImage: OpaquePointer(vkImg),
+                    vkImage: vkImg,
                     vkImageHandle: mk_vk_image_handle(vkImg),
                     vkSemaphore: sem,
                     mtlEvent: mtlEvent,
@@ -358,12 +381,9 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         let cur = ownedSlots
         ownedSlots = []
         slots.reinit(objects: [], skipCheckArgs: true)
-        let ctxPtr = UnsafeMutableRawPointer(vkContext)
-            .assumingMemoryBound(to: MKVulkanContext.self)
         for box in cur {
-            mk_vk_semaphore_destroy(ctxPtr, box.inner.vkSemaphore)
-            mk_vk_image_destroy(ctxPtr,
-                UnsafeMutablePointer<MKVulkanImage>(box.inner.vkImage))
+            mk_vk_semaphore_destroy(vkContext, box.inner.vkSemaphore)
+            mk_vk_image_destroy(vkContext, box.inner.vkImage)
         }
     }
 
@@ -650,3 +670,5 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
 // VK_FORMAT_B8G8R8A8_UNORM = 44 (we hardcode rather than depend on
 // vulkan_core.h being visible to Swift).
 private let VK_FORMAT_B8G8R8A8_UNORM_VALUE: Int32 = 44
+
+#endif
