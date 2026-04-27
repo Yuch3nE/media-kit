@@ -109,7 +109,6 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             mk_vk_context_destroy(vkContext)
             return nil
         }
-        let reportedAsyncSyncSupport = mk_vk_supports_metal_event_sync(vkContext)
         // MTLSharedEvent + Vulkan timeline semaphore async sync path is
         // currently not visually stable on macOS even after the import-mtl
         // sType fix (the texture imports succeed but the listener-driven
@@ -117,11 +116,6 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         // producing a black window). Keep the simpler vkQueueWaitIdle
         // blocking sync until that interaction is reworked.
         asyncSyncSupported = false
-        if reportedAsyncSyncSupport {
-            NSLog("TextureVK: MTLSharedEvent timeline sync available but disabled; using vkQueueWaitIdle blocking sync.")
-        } else {
-            NSLog("TextureVK: device does not support Metal-event sync; using vkQueueWaitIdle blocking sync.")
-        }
         refreshHostSurfaceFromCurrentScreen()
         startObservingScreenChanges()
     }

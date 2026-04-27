@@ -100,7 +100,6 @@ public class VideoOutput: NSObject {
           updateCallback: { [weak self] in self?.updateCallback() }
         ) {
           texture = SafeResizableTexture(vk)
-          NSLog("VideoOutput: using Vulkan/MoltenVK render path")
         } else {
           NSLog("VideoOutput: Vulkan path requested but unavailable; falling back to OpenGL")
         }

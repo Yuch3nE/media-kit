@@ -55,11 +55,10 @@ final controller = VideoController(
 
 | 日志 | 含义 |
 |---|---|
-| `TextureVK: async sync via MTLSharedEvent + Vk timeline enabled.` | 设备同时支持 `VK_KHR_timeline_semaphore` + `VK_EXT_metal_objects`，跨 API 同步走异步路径 |
-| `TextureVK: falling back to vkQueueWaitIdle blocking sync.` | 上述任意扩展缺失，回到 v1 阻塞同步（功能正确，CPU 占用稍高） |
 | `TextureVK: failed to create Vulkan context (MoltenVK missing?)` | 无法 dlopen Vulkan loader 或 instance 创建失败；通常是 MoltenVK 缺失或 ICD JSON 没装 |
 | `TextureVK: mpv_render_context_create failed: …` | libmpv 报错；查 mpv 日志 `--msg-level=vo=v` |
 | `TextureVK: mk_vk_image_import_mtl failed.` | `VK_EXT_metal_objects` 缺失或 `VkImportMetalTextureInfoEXT` 类型不被 MoltenVK 接受 |
+| `VideoOutput: Vulkan path requested but unavailable; falling back to OpenGL` | `TextureVK` 构造失败（设备/扩展缺失等），自动回退到 OpenGL `TextureHW` |
 
 校验帧确实走 Vulkan：
 
@@ -135,7 +134,7 @@ if let pb = textureVK.copyPixelBuffer()?.takeRetainedValue() {
 | `TextureVK` 创建立即失败 | MoltenVK 不存在或路径不对 | `otool -L` 看 libmpv 是否能找到 vulkan loader；`open -a Console.app` 搜 `MoltenVK` |
 | 帧显示偏色 / 过亮过暗 | colorspace 元数据没正确附加 | 用第 4 节手动 dump 验证 `kCVImageBuffer*` attachments |
 | HDR 视频显示成 SDR | `NSScreen.maximumExtendedDynamicRangeColorComponentValue` ≤ 1.0；显示器或 OS EDR 未启用 | 系统设置 → 显示器，确认 HDR 开关；外接 HDR 显示器需要 macOS ≥ 11 |
-| 渲染卡顿 / 帧率波动 | v2 异步同步未启用，走的是 vkQueueWaitIdle | 看 `TextureVK: ... blocking sync.` 日志；升级 MoltenVK 至支持 `VK_EXT_metal_objects` 的版本 |
+| 渲染卡顿 / 帧率波动 | 当前一律走 vkQueueWaitIdle 阻塞同步（async sync 路径暂未启用） | 留意第 7 节"已知限制"；async sync 重启后再考虑 |
 | `vkCreateDevice failed` | `VK_KHR_PORTABILITY_SUBSET` / 必要扩展未在 MoltenVK 中暴露 | 升级 MoltenVK；用 `vulkaninfo` 检查 |
 
 ---

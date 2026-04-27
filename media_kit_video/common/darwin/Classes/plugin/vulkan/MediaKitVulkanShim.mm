@@ -105,7 +105,6 @@ PFN_vkGetInstanceProcAddr resolve_loader() {
         auto fn = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
             dlsym(handle, "vkGetInstanceProcAddr"));
         if (fn) {
-            MK_VK_LOG(@"Loaded Vulkan loader from %s", candidates[i]);
             return fn;
         }
         dlclose(handle);
@@ -285,8 +284,6 @@ bool pick_physical_device(MKVulkanContext *c) {
     c->vkEnumeratePhysicalDevices(c->instance, &n, devs.data());
 
     for (auto pd : devs) {
-        VkPhysicalDeviceProperties props{};
-        c->vkGetPhysicalDeviceProperties(pd, &props);
         uint32_t qfn = 0;
         c->vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfn, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qfn);
@@ -298,12 +295,6 @@ bool pick_physical_device(MKVulkanContext *c) {
                 c->phys = pd;
                 c->qf_index = i;
                 c->qf_count = 1;
-                MK_VK_LOG(@"Picked device '%s' apiVersion=%u.%u.%u qf=%u",
-                          props.deviceName,
-                          VK_API_VERSION_MAJOR(props.apiVersion),
-                          VK_API_VERSION_MINOR(props.apiVersion),
-                          VK_API_VERSION_PATCH(props.apiVersion),
-                          i);
                 return true;
             }
         }
@@ -391,18 +382,6 @@ bool create_device(MKVulkanContext *c) {
     if (c->vkCreateDevice(c->phys, &dci, nullptr, &c->device) != VK_SUCCESS) {
         MK_VK_LOG(@"vkCreateDevice failed.");
         return false;
-    }
-
-    {
-        NSMutableString *exts = [NSMutableString string];
-        for (size_t i = 0; i < c->dev_exts.size(); i++) {
-            if (i) [exts appendString:@", "];
-            [exts appendFormat:@"%s", c->dev_exts[i]];
-        }
-        MK_VK_LOG(@"VkDevice created (qf=%u, count=%u, ext=%lu, timeline=%d, metal_objects=%d): %@",
-                  c->qf_index, c->qf_count,
-                  (unsigned long)c->dev_exts.size(),
-                  c->has_timeline_semaphore, c->has_metal_objects, exts);
     }
 
     // Per Vulkan spec, device-level entry points should be resolved via
