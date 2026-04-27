@@ -108,6 +108,7 @@ struct MKVulkanContext {
     VK_FN(vkEnumerateDeviceExtensionProperties);
     VK_FN(vkCreateDevice);
     VK_FN(vkDestroyDevice);
+    VK_FN(vkGetDeviceProcAddr);
     VK_FN(vkGetDeviceQueue);
     VK_FN(vkCreateCommandPool);
     VK_FN(vkDestroyCommandPool);
@@ -158,6 +159,7 @@ bool load_instance_fns(MKVulkanContext *c) {
     LOAD_INSTANCE_FN(c, vkGetPhysicalDeviceMemoryProperties);
     LOAD_INSTANCE_FN(c, vkCreateDevice);
     LOAD_INSTANCE_FN(c, vkDestroyDevice);
+    LOAD_INSTANCE_FN(c, vkGetDeviceProcAddr);
     LOAD_INSTANCE_FN(c, vkGetDeviceQueue);
     LOAD_INSTANCE_FN(c, vkCreateCommandPool);
     LOAD_INSTANCE_FN(c, vkDestroyCommandPool);
@@ -313,6 +315,38 @@ bool create_device(MKVulkanContext *c) {
         MK_VK_LOG(@"vkCreateDevice failed.");
         return false;
     }
+
+    // Per Vulkan spec, device-level entry points should be resolved via
+    // vkGetDeviceProcAddr to bypass loader trampolines. Required for
+    // correctness when running through MoltenVK and gives a small dispatch
+    // win on multi-device hosts.
+#define LOAD_DEVICE_FN(name_)                                                  \
+    do {                                                                       \
+        auto fn = reinterpret_cast<PFN_##name_>(                               \
+            c->vkGetDeviceProcAddr(c->device, #name_));                        \
+        if (fn) c->name_ = fn;                                                 \
+    } while (0)
+    LOAD_DEVICE_FN(vkDestroyDevice);
+    LOAD_DEVICE_FN(vkGetDeviceQueue);
+    LOAD_DEVICE_FN(vkCreateCommandPool);
+    LOAD_DEVICE_FN(vkDestroyCommandPool);
+    LOAD_DEVICE_FN(vkAllocateCommandBuffers);
+    LOAD_DEVICE_FN(vkFreeCommandBuffers);
+    LOAD_DEVICE_FN(vkBeginCommandBuffer);
+    LOAD_DEVICE_FN(vkEndCommandBuffer);
+    LOAD_DEVICE_FN(vkCreateImage);
+    LOAD_DEVICE_FN(vkDestroyImage);
+    LOAD_DEVICE_FN(vkGetImageMemoryRequirements);
+    LOAD_DEVICE_FN(vkAllocateMemory);
+    LOAD_DEVICE_FN(vkFreeMemory);
+    LOAD_DEVICE_FN(vkBindImageMemory);
+    LOAD_DEVICE_FN(vkCreateSemaphore);
+    LOAD_DEVICE_FN(vkDestroySemaphore);
+    LOAD_DEVICE_FN(vkQueueSubmit);
+    LOAD_DEVICE_FN(vkQueueWaitIdle);
+    LOAD_DEVICE_FN(vkDeviceWaitIdle);
+#undef LOAD_DEVICE_FN
+
     c->vkGetDeviceQueue(c->device, c->qf_index, 0, &c->queue);
 
     VkCommandPoolCreateInfo cpci{};
