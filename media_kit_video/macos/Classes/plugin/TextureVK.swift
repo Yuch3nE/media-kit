@@ -1,6 +1,7 @@
 import FlutterMacOS
 import Metal
 import CoreVideo
+import AppKit
 
 // TextureVK: macOS FlutterTexture that drives mpv's Vulkan render backend
 // (MPV_RENDER_API_TYPE_VULKAN) over MoltenVK, producing CVPixelBuffer frames
@@ -47,6 +48,15 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     // depending on SwappableObjectManager internals.
     private var ownedSlots: [SlotBox] = []
 
+    // --- HDR / colorspace pass-through state --------------------------------
+    // What we tell mpv the host surface looks like (target state). Updated on
+    // screen change. Strings use mpv's color option naming (see render_vk.h).
+    private var hostSurfacePrimaries: String = "display-p3"
+    private var hostSurfaceTransfer:  String = "srgb"
+    private var hostSurfaceMaxLuma:   Float  = 0.0  // 0 = unknown
+    private var hostSurfaceMinLuma:   Float  = 0.0
+    private var screenObserver: NSObjectProtocol?
+
     // Wraps Slot in a class so SwappableObjectManager (which expects AnyObject)
     // can hold it.
     final class SlotBox {
@@ -77,9 +87,12 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
                 .assumingMemoryBound(to: MKVulkanContext.self))
             return nil
         }
+        refreshHostSurfaceFromCurrentScreen()
+        startObservingScreenChanges()
     }
 
     deinit {
+        stopObservingScreenChanges()
         disposeSlots()
         if let rc = renderContext {
             mpv_render_context_set_update_callback(rc, nil, nil)
@@ -121,8 +134,17 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         image.wait_value      = 0
         image.signal_semaphore = box.inner.vkSemaphore
         image.signal_value    = 0
-        image.surface_primaries = ("display-p3" as NSString).utf8String
-        image.surface_transfer  = ("srgb" as NSString).utf8String
+
+        // Surface description. mpv consumes these as host-target hints via the
+        // libmpv_gpu_next_context_vk backend (see render_vk.h doc).
+        let primCStr = (hostSurfacePrimaries as NSString).utf8String
+        let trcCStr  = (hostSurfaceTransfer  as NSString).utf8String
+        image.surface_primaries = primCStr
+        image.surface_transfer  = trcCStr
+        image.surface_min_luma  = hostSurfaceMinLuma
+        image.surface_max_luma  = hostSurfaceMaxLuma
+        image.surface_max_cll   = 0
+        image.surface_max_fall  = 0
 
         var imageMut = image
         withUnsafeMutablePointer(to: &imageMut) { imgPtr in
@@ -140,6 +162,11 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             UnsafeMutableRawPointer(vkContext)
                 .assumingMemoryBound(to: MKVulkanContext.self),
             box.inner.vkSemaphore)
+
+        // After the frame is final, ask mpv what color space it actually
+        // produced and stamp the matching CV attachments onto the pixel
+        // buffer so Core Animation / Flutter color-manage correctly.
+        applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
 
         slots.pushAsReady(box)
     }
@@ -283,4 +310,153 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
                 UnsafeMutablePointer<MKVulkanImage>(box.inner.vkImage))
         }
     }
+
+    // MARK: - HDR / colorspace pass-through ------------------------------------
+
+    private func startObservingScreenChanges() {
+        screenObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refreshHostSurfaceFromCurrentScreen()
+        }
+    }
+
+    private func stopObservingScreenChanges() {
+        if let o = screenObserver {
+            NotificationCenter.default.removeObserver(o)
+            screenObserver = nil
+        }
+    }
+
+    // Probe the current main screen's color profile + EDR capability and turn
+    // it into mpv-compatible (primaries, transfer, luma) tuples that we feed
+    // back into the Vulkan render backend through MPV_RENDER_PARAM_VK_TARGET_STATE.
+    private func refreshHostSurfaceFromCurrentScreen() {
+        guard let screen = NSScreen.main else { return }
+
+        // Primaries: rough heuristic based on the screen's NSColorSpace name.
+        // mpv accepts the canonical name strings listed in render_vk.h.
+        var primaries = "display-p3"
+        if let cs = screen.colorSpace, let name = cs.localizedName {
+            let lc = name.lowercased()
+            if lc.contains("rec") && lc.contains("2020") {
+                primaries = "bt.2020"
+            } else if lc.contains("p3") {
+                primaries = "display-p3"
+            } else if lc.contains("srgb") || lc.contains("rec") || lc.contains("709") {
+                primaries = "bt.709"
+            }
+        }
+
+        // Transfer: macOS in EDR mode signals capability via
+        // maximumExtendedDynamicRangeColorComponentValue. Treat > 1.0 as HDR
+        // and request PQ; otherwise stay on sRGB so SDR content does not get
+        // tone-mapped unnecessarily.
+        let maxEDR = Float(screen.maximumExtendedDynamicRangeColorComponentValue)
+        let transfer = maxEDR > 1.0 ? "pq" : "srgb"
+        let maxLuma: Float = maxEDR > 1.0 ? maxEDR * 100.0 : 0.0
+        let minLuma: Float = maxEDR > 1.0 ? 0.001 : 0.0
+
+        hostSurfacePrimaries = primaries
+        hostSurfaceTransfer  = transfer
+        hostSurfaceMaxLuma   = maxLuma
+        hostSurfaceMinLuma   = minLuma
+
+        publishTargetStateToMPV()
+    }
+
+    // Push the current host surface description into mpv proactively (not
+    // tied to a particular VkImage) so the colorspace hint can be queried
+    // before the first render call.
+    private func publishTargetStateToMPV() {
+        guard let rc = renderContext else { return }
+
+        var image = mpv_vulkan_image()
+        // Only the surface description fields are read by VK_TARGET_STATE.
+        image.format = UInt32(VK_FORMAT_B8G8R8A8_UNORM_VALUE)
+        image.surface_primaries = (hostSurfacePrimaries as NSString).utf8String
+        image.surface_transfer  = (hostSurfaceTransfer  as NSString).utf8String
+        image.surface_min_luma  = hostSurfaceMinLuma
+        image.surface_max_luma  = hostSurfaceMaxLuma
+
+        withUnsafeMutablePointer(to: &image) { ptr in
+            _ = mpv_render_context_set_parameter(
+                rc,
+                mpv_render_param(type: MPV_RENDER_PARAM_VK_TARGET_STATE,
+                                 data: UnsafeMutableRawPointer(ptr)))
+        }
+    }
+
+    // After each frame, ask mpv which colorspace it actually wrote and stamp
+    // matching CV attachments onto the pixel buffer Flutter will sample.
+    // Without this, Core Animation defaults to assuming sRGB and HDR / wide
+    // gamut frames render with wrong colors.
+    private func applyColorspaceHintToPixelBuffer(_ pb: CVPixelBuffer) {
+        guard let rc = renderContext else { return }
+
+        var hint = mpv_vulkan_colorspace_hint()
+        let rcv = withUnsafeMutablePointer(to: &hint) { hp -> Int32 in
+            mpv_render_context_get_info(
+                rc,
+                mpv_render_param(type: MPV_RENDER_PARAM_VK_COLORSPACE_HINT,
+                                 data: UnsafeMutableRawPointer(hp)))
+        }
+        guard rcv >= 0, hint.state.rawValue == MPV_VULKAN_COLORSPACE_HINT_SET.rawValue,
+              let primCStr = hint.primaries, let trcCStr = hint.transfer
+        else { return }
+
+        let primaries = String(cString: primCStr)
+        let transfer  = String(cString: trcCStr)
+
+        if let cvPrim = TextureVK.cvPrimaries(forName: primaries) {
+            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                                  cvPrim, .shouldPropagate)
+        }
+        if let cvTrc = TextureVK.cvTransfer(forName: transfer) {
+            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                                  cvTrc, .shouldPropagate)
+        }
+        // Default YCbCr matrix is irrelevant for RGB pixel buffers but Core
+        // Image still consults the key; supply the matching primaries-derived
+        // matrix to avoid a "missing matrix" warning.
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                              .shouldPropagate)
+    }
+
+    private static func cvPrimaries(forName name: String) -> CFString? {
+        switch name {
+        case "bt.709":      return kCVImageBufferColorPrimaries_ITU_R_709_2
+        case "display-p3":  return kCVImageBufferColorPrimaries_P3_D65
+        case "bt.2020":     return kCVImageBufferColorPrimaries_ITU_R_2020
+        case "smpte-431", "dci-p3": return kCVImageBufferColorPrimaries_DCI_P3
+        case "bt.601-525":  return kCVImageBufferColorPrimaries_SMPTE_C
+        case "bt.601-625":  return kCVImageBufferColorPrimaries_EBU_3213
+        default:            return nil
+        }
+    }
+
+    private static func cvTransfer(forName name: String) -> CFString? {
+        switch name {
+        case "bt.1886", "bt.709":
+            return kCVImageBufferTransferFunction_ITU_R_709_2
+        case "srgb":
+            return kCVImageBufferTransferFunction_sRGB
+        case "linear":
+            return kCVImageBufferTransferFunction_Linear
+        case "pq":
+            return kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
+        case "hlg":
+            return kCVImageBufferTransferFunction_ITU_R_2100_HLG
+        case "gamma2.2":
+            return kCVImageBufferTransferFunction_UseGamma
+        default:
+            return nil
+        }
+    }
 }
+
+// VK_FORMAT_B8G8R8A8_UNORM = 44 (we hardcode rather than depend on
+// vulkan_core.h being visible to Swift).
+private let VK_FORMAT_B8G8R8A8_UNORM_VALUE: Int32 = 44
