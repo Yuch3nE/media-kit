@@ -331,6 +331,7 @@ bool create_device(MKVulkanContext *c) {
         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
         "VK_EXT_metal_objects",                  // MTLTexture/MTLSharedEvent import
+        "VK_EXT_external_memory_metal",          // METAL_TEXTURE_BIT_EXT handle type
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
         VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
@@ -562,9 +563,14 @@ MKVulkanImage *mk_vk_image_import_mtl(MKVulkanContext *c,
 
     auto *img = new MKVulkanImage();
     img->format = fmt;
+    // Intentionally exclude VK_IMAGE_USAGE_STORAGE_BIT: on MoltenVK / Metal,
+    // MTLPixelFormatBGRA8Unorm does not support shader read+write storage.
+    // Mixing STORAGE into the import usage causes vkCreateImage(metal-import)
+    // to fail for any non-trivial size (e.g. 3840x2160). gpu-next/libplacebo
+    // only needs the target as a color attachment + sampled source + blit
+    // destination, none of which require STORAGE.
     img->usage  = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                   VK_IMAGE_USAGE_SAMPLED_BIT |
-                  VK_IMAGE_USAGE_STORAGE_BIT |
                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     MKVkImportMetalTextureInfoEXT mtli{};
@@ -576,11 +582,16 @@ MKVulkanImage *mk_vk_image_import_mtl(MKVulkanContext *c,
     // MoltenVK this image's storage comes from outside Vulkan. Without it
     // MoltenVK silently allocates its own MTLTexture and renders there
     // instead of the imported one (= guaranteed black pixels for the host).
-    // VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT = 0x00000400.
+    //
+    // The correct handle type is VK_EXTERNAL_MEMORY_HANDLE_TYPE_METAL_TEXTURE_BIT_EXT
+    // (0x00020000) from VK_EXT_external_memory_metal. The previously-used 0x400 is
+    // ANDROID_HARDWARE_BUFFER_BIT_ANDROID, which MoltenVK rejects with
+    // VK_ERROR_FEATURE_NOT_PRESENT ("Only Metal and host external memory handle
+    // types are supported.").
     VkExternalMemoryImageCreateInfo extMem{};
     extMem.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
     extMem.pNext = &mtli;
-    extMem.handleTypes = (VkExternalMemoryHandleTypeFlags)0x00000400;
+    extMem.handleTypes = (VkExternalMemoryHandleTypeFlags)0x00020000;
 
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -596,8 +607,9 @@ MKVulkanImage *mk_vk_image_import_mtl(MKVulkanContext *c,
     ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (c->vkCreateImage(c->device, &ici, nullptr, &img->image) != VK_SUCCESS) {
-        MK_VK_LOG(@"vkCreateImage(metal-import) failed.");
+    if (VkResult vr = c->vkCreateImage(c->device, &ici, nullptr, &img->image); vr != VK_SUCCESS) {
+        MK_VK_LOG(@"vkCreateImage(metal-import) failed (VkResult=%d, ext=%ux%u, fmt=%d, usage=0x%x).",
+                  (int)vr, width, height, (int)fmt, (unsigned)img->usage);
         delete img;
         return nullptr;
     }

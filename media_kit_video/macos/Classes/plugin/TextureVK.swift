@@ -363,7 +363,12 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
             width: width, height: height, mipmapped: false)
-        desc.usage = [.renderTarget, .shaderRead, .shaderWrite]
+        // IOSurface-backed BGRA8Unorm textures on Metal/macOS support
+        // renderTarget + shaderRead but NOT shaderWrite (no read+write
+        // storage capability for BGRA8). Adding .shaderWrite makes the
+        // backing IOSurface incompatible with the Vulkan import path on
+        // MoltenVK at large sizes (e.g. 4K), so keep it minimal.
+        desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .shared
         guard let tex = mtlDevice.makeTexture(descriptor: desc, iosurface: iosurface, plane: 0) else {
             NSLog("TextureVK: MTLDevice.makeTexture failed.")
