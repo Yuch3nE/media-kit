@@ -148,6 +148,19 @@ class Media extends Playable {
       // Handle asset:// scheme. Only for Flutter.
       return AssetLoader.load(uri);
     }
+    // Windows UNC paths (e.g. `\\server\share\file.mkv`).
+    //
+    // The third-party `uri_parser` package indiscriminately rewrites every
+    // backslash to a forward slash, turning `\\server\share\file.mkv` into
+    // `//server/share/file.mkv`, then hands that string to libmpv. On
+    // Windows libmpv treats that as neither a valid `file://` URI nor a
+    // valid local path and blocks forever in the stream-open stage.
+    //
+    // libmpv's win32 file backend accepts the raw UNC string as-is, so we
+    // short-circuit normalization here and pass the original through.
+    if (Platform.isWindows && uri.startsWith(r'\\')) {
+      return uri;
+    }
     // content:// URI support for Android.
     try {
       if (Platform.isAndroid) {
