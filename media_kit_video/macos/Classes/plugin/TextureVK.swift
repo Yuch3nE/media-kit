@@ -58,7 +58,9 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     // signaled value. Bumped per render call. Starts at 1 (0 is reserved by
     // render_vk.h to mean "binary semaphore").
     private var nextSignalValue: UInt64 = 0
-    private let sharedEventListener = MTLSharedEventListener()
+    // Process-wide singleton. Each MTLSharedEventListener spins up its own
+    // dispatch queue / runloop; sharing avoids paying that cost per player.
+    private static let sharedEventListener = MTLSharedEventListener()
 
     // --- HDR / colorspace pass-through state --------------------------------
     // What we tell mpv the host surface looks like (target state). Updated on
@@ -190,7 +192,7 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             // mpv signals on the Vk side via timeline semaphore). The worker
             // thread is freed immediately while the slot publishes itself
             // once the GPU is genuinely done.
-            mtlEvent.notify(sharedEventListener, atValue: signalValue) { [weak self] _, _ in
+            mtlEvent.notify(TextureVK.sharedEventListener, atValue: signalValue) { [weak self] _, _ in
                 guard let self = self else { return }
                 self.slots.pushAsReady(box)
                 // FlutterTextureRegistry / updateCallback consumers expect
@@ -389,17 +391,30 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     private func refreshHostSurfaceFromCurrentScreen() {
         guard let screen = NSScreen.main else { return }
 
-        // Primaries: rough heuristic based on the screen's NSColorSpace name.
-        // mpv accepts the canonical name strings listed in render_vk.h.
+        // Primaries: identify by CGColorSpace.name CFString comparison rather
+        // than localizedName (which varies by locale and OS version). Falls
+        // back to display-p3 since that is the de-facto Apple wide-gamut
+        // baseline.
         var primaries = "display-p3"
-        if let cs = screen.colorSpace, let name = cs.localizedName {
-            let lc = name.lowercased()
-            if lc.contains("rec") && lc.contains("2020") {
+        if let cgcs = screen.colorSpace?.cgColorSpace,
+           let name = cgcs.name as String? {
+            switch name as CFString {
+            case CGColorSpace.itur_2020,
+                 CGColorSpace.itur_2020_PQ,
+                 CGColorSpace.itur_2020_HLG:
                 primaries = "bt.2020"
-            } else if lc.contains("p3") {
+            case CGColorSpace.displayP3,
+                 CGColorSpace.displayP3_PQ,
+                 CGColorSpace.displayP3_HLG,
+                 CGColorSpace.dcip3:
                 primaries = "display-p3"
-            } else if lc.contains("srgb") || lc.contains("rec") || lc.contains("709") {
+            case CGColorSpace.sRGB,
+                 CGColorSpace.linearSRGB,
+                 CGColorSpace.extendedSRGB,
+                 CGColorSpace.itur_709:
                 primaries = "bt.709"
+            default:
+                break
             }
         }
 

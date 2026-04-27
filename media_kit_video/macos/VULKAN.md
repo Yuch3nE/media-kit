@@ -146,3 +146,8 @@ if let pb = textureVK.copyPixelBuffer()?.takeRetainedValue() {
 - 单 queue family 假设：`pl_vulkan_import` 三个 queue family 字段都填同一个，足够 MoltenVK 但不通用
 - `surface_max_cll` / `surface_max_fall`（host → mpv 方向）当前固定 0，未从屏幕能力推导
 - HDR blob 中 white point 仅覆盖 D65 / DCI；非常规 white point 需扩展 `chromaticities` 表
+
+## 8. 已应用的内部优化
+
+- `MTLSharedEventListener` 改为类静态单例，避免每个 `TextureVK` 实例额外占用一个系统派发队列
+- 屏幕色域识别从 `NSColorSpace.localizedName` 字符串模糊匹配改为 `CGColorSpace.name` 与 `CGColorSpace.displayP3 / itur_2020 / sRGB / itur_709 / dcip3 / *_PQ / *_HLG` 等系统常量精确比对，避开 locale / OS 版本敏感性
