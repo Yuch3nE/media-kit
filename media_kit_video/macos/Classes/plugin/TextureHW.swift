@@ -11,6 +11,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private let context: CGLContextObj
   private let textureCache: CVOpenGLTextureCache
   private var renderContext: OpaquePointer?
+  private var screenObserver: NSObjectProtocol?
   private var textureContexts = SwappableObjectManager<TextureGLContext>(
     objects: [],
     skipCheckArgs: true
@@ -29,9 +30,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     super.init()
 
     self.initMPV()
+    self.applyDisplayICCProfile()
+    self.startObservingScreenChanges()
   }
 
   deinit {
+    stopObservingScreenChanges()
     disposePixelBuffer()
     disposeMPV()
     OpenGLHelpers.deleteTextureCache(textureCache)
@@ -116,6 +120,53 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     mpv_render_context_free(renderContext)
   }
 
+  // Push the current display's ICC profile to the gpu-next backend so the
+  // colour pipeline targets the actual monitor instead of falling back to
+  // generic sRGB. Without this, P3/HDR-capable displays receive incorrect
+  // colour reproduction.
+  private func applyDisplayICCProfile() {
+    guard renderContext != nil else { return }
+
+    // Tell mpv we are supplying the ICC ourselves; this also keeps the
+    // injected profile from being cleared on the next options update.
+    mpv_set_property_string(handle, "icc-profile-auto", "yes")
+
+    guard let icc = NSScreen.main?.colorSpace?.iccProfileData else {
+      return
+    }
+    let nsData = icc as NSData
+    var byteArray = mpv_byte_array(
+      data: UnsafeMutableRawPointer(mutating: nsData.bytes),
+      size: nsData.length
+    )
+    withUnsafeMutablePointer(to: &byteArray) { ptr in
+      _ = mpv_render_context_set_parameter(
+        renderContext,
+        MPV_RENDER_PARAM_ICC_PROFILE,
+        UnsafeMutableRawPointer(ptr)
+      )
+    }
+  }
+
+  private func startObservingScreenChanges() {
+    // Re-inject the ICC profile when the screen layout changes (display
+    // hot-plug, resolution change, dragging the window between displays, ...).
+    screenObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.didChangeScreenParametersNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.applyDisplayICCProfile()
+    }
+  }
+
+  private func stopObservingScreenChanges() {
+    if let observer = screenObserver {
+      NotificationCenter.default.removeObserver(observer)
+      screenObserver = nil
+    }
+  }
+
   public func resize(_ size: CGSize) {
     if size.width == 0 || size.height == 0 {
       return
@@ -151,15 +202,21 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   }
 
   private func disposePixelBuffer() {
+    // The GL context must be current before releasing TextureGLContext
+    // instances, since their deinit may need to delete GL fence sync objects
+    // bound to the context.
+    CGLSetCurrentContext(context)
+    defer {
+      CGLSetCurrentContext(nil)
+    }
+
     textureContexts.reinit(objects: [], skipCheckArgs: true)
 
     // `glDeleteTextures` alone does not release the IOSurface backing the
     // CVOpenGLTexture; the texture cache keeps an internal reference until
     // it is flushed. Without this call, every resize accumulates retained
     // IOSurfaces until the cache itself is destroyed.
-    CGLSetCurrentContext(context)
     CVOpenGLTextureCacheFlush(textureCache, 0)
-    CGLSetCurrentContext(nil)
   }
 
   public func render(_ size: CGSize) {
@@ -173,6 +230,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       OpenGLHelpers.checkError("render")
       CGLSetCurrentContext(nil)
     }
+
+    // Block until the GPU has finished writing to this slot during its
+    // previous turn, otherwise Flutter could sample a half-written IOSurface.
+    // Triple buffering means each slot only waits roughly one frame later, so
+    // the GPU still pipelines work without serialization.
+    textureContext!.waitAndClearFence()
 
     glBindFramebuffer(GLenum(GL_FRAMEBUFFER), textureContext!.frameBuffer)
     defer {
@@ -194,6 +257,10 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     mpv_render_context_render(renderContext, &params)
 
     glFlush()
+
+    // Insert a fence representing the GPU completion of this render so the
+    // next reuse of this slot can wait on it before issuing new GL work.
+    textureContext!.insertFence()
 
     textureContexts.pushAsReady(textureContext!)
   }
