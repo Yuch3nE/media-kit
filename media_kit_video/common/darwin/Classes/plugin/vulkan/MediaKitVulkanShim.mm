@@ -90,6 +90,10 @@ struct MKVulkanContext {
     VkCommandPool    pool     = VK_NULL_HANDLE;
 
     VkPhysicalDeviceFeatures2 features2{};
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline{};
+
+    bool has_timeline_semaphore = false;
+    bool has_metal_objects = false;
 
     std::vector<const char *> dev_exts;
     std::mutex                queue_mutex;
@@ -251,8 +255,10 @@ bool create_device(MKVulkanContext *c) {
     static const char *kWanted[] = {
         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
         VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-        "VK_EXT_metal_objects",                  // MTLTexture import
+        "VK_EXT_metal_objects",                  // MTLTexture/MTLSharedEvent import
         VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+        VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
         VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
         VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
         VK_KHR_BIND_MEMORY_2_EXTENSION_NAME,
@@ -262,14 +268,31 @@ bool create_device(MKVulkanContext *c) {
         VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
     };
     for (auto e : kWanted) {
-        if (has(e))
+        if (has(e)) {
             c->dev_exts.push_back(e);
+            if (strcmp(e, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) == 0)
+                c->has_timeline_semaphore = true;
+            if (strcmp(e, "VK_EXT_metal_objects") == 0)
+                c->has_metal_objects = true;
+        }
     }
 
     // Query features once and pass them straight through to libmpv. libplacebo
-    // requires features2.
+    // requires features2. Add timelineSemaphore = TRUE when the extension is
+    // present so we can use MTLSharedEvent-backed timeline semaphores for
+    // async cross-API sync.
     c->features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    c->timeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    if (c->has_timeline_semaphore) {
+        c->features2.pNext = &c->timeline;
+    }
     c->vkGetPhysicalDeviceFeatures2(c->phys, &c->features2);
+    if (c->has_timeline_semaphore && !c->timeline.timelineSemaphore) {
+        // Driver does not actually support timelines despite the extension
+        // being listed. Drop our claim so device creation does not assert.
+        c->has_timeline_semaphore = false;
+        c->features2.pNext = nullptr;
+    }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci{};
@@ -499,6 +522,47 @@ void mk_vk_wait_semaphore_blocking(MKVulkanContext *c, uint64_t sem) {
         c->vkQueueSubmit(c->queue, 1, &si, VK_NULL_HANDLE);
         c->vkQueueWaitIdle(c->queue);
     }
+}
+
+bool mk_vk_supports_metal_event_sync(MKVulkanContext *c) {
+    return c && c->has_timeline_semaphore && c->has_metal_objects;
+}
+
+// VK_EXT_metal_objects: VkImportMetalSharedEventInfoEXT goes in the pNext
+// chain of VkSemaphoreCreateInfo (combined with a timeline-semaphore type)
+// to produce a VkSemaphore whose payload is the same MTLSharedEvent value
+// the host can observe / signal from Metal command buffers.
+typedef struct MKVkImportMetalSharedEventInfoEXT {
+    VkStructureType  sType;
+    const void      *pNext;
+    void            *mtlSharedEvent; // id<MTLSharedEvent>
+} MKVkImportMetalSharedEventInfoEXT;
+enum { MK_VK_STRUCTURE_TYPE_IMPORT_METAL_SHARED_EVENT_INFO_EXT = 1000311006 };
+
+uint64_t mk_vk_semaphore_import_mtl_event(MKVulkanContext *c, void *mtl_event) {
+    if (!mk_vk_supports_metal_event_sync(c) || !mtl_event) return 0;
+
+    MKVkImportMetalSharedEventInfoEXT mei{};
+    mei.sType = (VkStructureType)MK_VK_STRUCTURE_TYPE_IMPORT_METAL_SHARED_EVENT_INFO_EXT;
+    mei.mtlSharedEvent = mtl_event;
+
+    VkSemaphoreTypeCreateInfo stype{};
+    stype.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    stype.pNext = &mei;
+    stype.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    stype.initialValue = 0;
+
+    VkSemaphoreCreateInfo sci{};
+    sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    sci.pNext = &stype;
+
+    VkSemaphore sem = VK_NULL_HANDLE;
+    VkResult rc = c->vkCreateSemaphore(c->device, &sci, nullptr, &sem);
+    if (rc != VK_SUCCESS) {
+        MK_VK_LOG(@"vkCreateSemaphore(MTLSharedEvent import) failed: %d", rc);
+        return 0;
+    }
+    return (uint64_t)(uintptr_t)sem;
 }
 
 } // extern "C"

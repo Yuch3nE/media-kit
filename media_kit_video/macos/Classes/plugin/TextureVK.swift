@@ -30,6 +30,10 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         let vkImage:     OpaquePointer  // MKVulkanImage*
         let vkImageHandle: UInt64       // VkImage handle for mpv
         let vkSemaphore:   UInt64       // VkSemaphore handle for mpv
+        // Async cross-API sync. When non-nil, vkSemaphore is a timeline
+        // semaphore backed by the same MTLSharedEvent and we drive it via
+        // monotonically increasing payload values.
+        let mtlEvent:      MTLSharedEvent?
         let format:        UInt32
         let usage:         UInt32
         let width:         UInt32
@@ -47,6 +51,14 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     // Mirror list of all slots so we can free them on resize/teardown without
     // depending on SwappableObjectManager internals.
     private var ownedSlots: [SlotBox] = []
+
+    // --- Async cross-API sync (MTLSharedEvent + Vulkan timeline semaphore) --
+    private var asyncSyncSupported: Bool = false
+    // Monotonic counter used as VkSemaphore signal_value & MTLSharedEvent
+    // signaled value. Bumped per render call. Starts at 1 (0 is reserved by
+    // render_vk.h to mean "binary semaphore").
+    private var nextSignalValue: UInt64 = 0
+    private let sharedEventListener = MTLSharedEventListener()
 
     // --- HDR / colorspace pass-through state --------------------------------
     // What we tell mpv the host surface looks like (target state). Updated on
@@ -87,6 +99,13 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
                 .assumingMemoryBound(to: MKVulkanContext.self))
             return nil
         }
+        asyncSyncSupported = mk_vk_supports_metal_event_sync(
+            UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self))
+        if asyncSyncSupported {
+            NSLog("TextureVK: async sync via MTLSharedEvent + Vk timeline enabled.")
+        } else {
+            NSLog("TextureVK: falling back to vkQueueWaitIdle blocking sync.")
+        }
         refreshHostSurfaceFromCurrentScreen()
         startObservingScreenChanges()
     }
@@ -119,6 +138,13 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     public func render(_ size: CGSize) {
         guard let rc = renderContext, let box = slots.nextAvailable() else { return }
 
+        // Pick a fresh signal value for timeline mode; binary mode uses 0.
+        var signalValue: UInt64 = 0
+        if box.inner.mtlEvent != nil {
+            nextSignalValue &+= 1
+            signalValue = nextSignalValue
+        }
+
         var image = mpv_vulkan_image()
         image.image           = box.inner.vkImageHandle
         image.width           = box.inner.width
@@ -133,7 +159,7 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         image.wait_semaphore  = 0
         image.wait_value      = 0
         image.signal_semaphore = box.inner.vkSemaphore
-        image.signal_value    = 0
+        image.signal_value    = signalValue
 
         // Surface description. mpv consumes these as host-target hints via the
         // libmpv_gpu_next_context_vk backend (see render_vk.h doc).
@@ -156,19 +182,27 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             mpv_render_context_render(rc, &params)
         }
 
-        // Wait until the GPU finishes writing into the MTLTexture so Flutter
-        // can sample without tearing. v2: replace with MTLSharedEvent wait.
-        mk_vk_wait_semaphore_blocking(
-            UnsafeMutableRawPointer(vkContext)
-                .assumingMemoryBound(to: MKVulkanContext.self),
-            box.inner.vkSemaphore)
-
-        // After the frame is final, ask mpv what color space it actually
-        // produced and stamp the matching CV attachments onto the pixel
-        // buffer so Core Animation / Flutter color-manage correctly.
         applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
 
-        slots.pushAsReady(box)
+        if let mtlEvent = box.inner.mtlEvent {
+            // Async path: register a listener that fires when the GPU has
+            // signalled the MTLSharedEvent (which is the same payload that
+            // mpv signals on the Vk side via timeline semaphore). The worker
+            // thread is freed immediately while the slot publishes itself
+            // once the GPU is genuinely done.
+            mtlEvent.notify(sharedEventListener, atValue: signalValue) { [weak self] _, _ in
+                guard let self = self else { return }
+                self.slots.pushAsReady(box)
+                self.updateCallback()
+            }
+        } else {
+            // Blocking fallback: vkQueueWaitIdle on a tiny submission.
+            mk_vk_wait_semaphore_blocking(
+                UnsafeMutableRawPointer(vkContext)
+                    .assumingMemoryBound(to: MKVulkanContext.self),
+                box.inner.vkSemaphore)
+            slots.pushAsReady(box)
+        }
     }
 
     // MARK: internals
@@ -281,9 +315,25 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             return nil
         }
 
-        // 4. Per-slot binary semaphore.
-        let sem = mk_vk_semaphore_create(
-            UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self))
+        // 4. Per-slot semaphore. Prefer MTLSharedEvent-backed timeline sem
+        //    (async sync); fall back to a plain binary semaphore if the
+        //    device cannot import Metal events.
+        var mtlEvent: MTLSharedEvent? = nil
+        var sem: UInt64 = 0
+        if asyncSyncSupported,
+           let ev = mtlDevice.makeSharedEvent() {
+            let evPtr = Unmanaged.passUnretained(ev).toOpaque()
+            sem = mk_vk_semaphore_import_mtl_event(
+                UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self),
+                evPtr)
+            if sem != 0 {
+                mtlEvent = ev
+            }
+        }
+        if sem == 0 {
+            sem = mk_vk_semaphore_create(
+                UnsafeMutableRawPointer(vkContext).assumingMemoryBound(to: MKVulkanContext.self))
+        }
         if sem == 0 {
             mk_vk_image_destroy(UnsafeMutableRawPointer(vkContext)
                 .assumingMemoryBound(to: MKVulkanContext.self), vkImg)
@@ -294,6 +344,7 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
                     vkImage: OpaquePointer(vkImg),
                     vkImageHandle: mk_vk_image_handle(vkImg),
                     vkSemaphore: sem,
+                    mtlEvent: mtlEvent,
                     format: vkFormat, usage: vkUsage,
                     width: UInt32(width), height: UInt32(height))
     }

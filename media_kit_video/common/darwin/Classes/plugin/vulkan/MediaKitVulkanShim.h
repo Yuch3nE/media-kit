@@ -74,6 +74,21 @@ uint64_t       mk_vk_image_handle(MKVulkanImage *img); // VkImage as uint64_t
 uint64_t mk_vk_semaphore_create(MKVulkanContext *ctx);
 void     mk_vk_semaphore_destroy(MKVulkanContext *ctx, uint64_t semaphore);
 
+// Create a Vulkan timeline semaphore that is backed by an MTLSharedEvent
+// (typed as void* / id<MTLSharedEvent>). The same payload value space is
+// shared between the Metal and Vulkan sides, enabling lock-free cross-API
+// synchronization without vkQueueWaitIdle.
+//
+// Returns 0 if VK_EXT_metal_objects (or timeline semaphore support) is
+// unavailable on the active device. The caller must fall back to
+// mk_vk_semaphore_create + mk_vk_wait_semaphore_blocking in that case.
+uint64_t mk_vk_semaphore_import_mtl_event(MKVulkanContext *ctx,
+                                          void *mtl_shared_event);
+
+// Returns true if the underlying device supports VK_KHR_timeline_semaphore
+// AND VK_EXT_metal_objects MTLSharedEvent import. Cached after first probe.
+bool mk_vk_supports_metal_event_sync(MKVulkanContext *ctx);
+
 // After mpv has signalled `semaphore` from inside mpv_render_context_render,
 // the host must wait on it before letting Metal sample the underlying
 // MTLTexture. This call submits an empty queue submission that waits on
