@@ -525,7 +525,16 @@ void mk_vk_context_unlock_queue(void *ctx, uint32_t qf, uint32_t qi) {
 // We keep the struct definition local so we don't depend on a recent
 // vulkan_metal.h that may or may not have shipped with the SDK.
 typedef enum {
-    MK_VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT = 1000311004,
+    // Per VK_EXT_metal_objects spec:
+    //   1000311004 EXPORT_METAL_BUFFER_INFO_EXT
+    //   1000311005 IMPORT_METAL_BUFFER_INFO_EXT
+    //   1000311006 EXPORT_METAL_TEXTURE_INFO_EXT
+    //   1000311007 IMPORT_METAL_TEXTURE_INFO_EXT  <-- correct value
+    // Using the wrong sType makes MoltenVK silently ignore the pNext entry
+    // and allocate its own backing MTLTexture instead of importing ours,
+    // causing the IOSurface to stay all zeros even though every Vulkan
+    // call returns success.
+    MK_VK_STRUCTURE_TYPE_IMPORT_METAL_TEXTURE_INFO_EXT = 1000311007,
 } MKVkExtMetalObjectsStructType;
 
 typedef struct MKVkImportMetalTextureInfoEXT {
@@ -578,24 +587,21 @@ MKVulkanImage *mk_vk_image_import_mtl(MKVulkanContext *c,
     mtli.plane = VK_IMAGE_ASPECT_COLOR_BIT;
     mtli.mtlTexture = mtl_texture;
 
-    // VkExternalMemoryImageCreateInfo MUST be in the pNext chain to tell
-    // MoltenVK this image's storage comes from outside Vulkan. Without it
-    // MoltenVK silently allocates its own MTLTexture and renders there
-    // instead of the imported one (= guaranteed black pixels for the host).
+    // IMPORTANT: do NOT also chain VkExternalMemoryImageCreateInfo here.
+    // VkImportMetalTextureInfoEXT is MoltenVK's native metal-import path:
+    // when present, MoltenVK marks the VkImage as 'externally owned' and
+    // uses the supplied MTLTexture as its backing storage directly. We do
+    // not call vkAllocateMemory / vkBindImageMemory in that case.
     //
-    // The correct handle type is VK_EXTERNAL_MEMORY_HANDLE_TYPE_METAL_TEXTURE_BIT_EXT
-    // (0x00020000) from VK_EXT_external_memory_metal. The previously-used 0x400 is
-    // ANDROID_HARDWARE_BUFFER_BIT_ANDROID, which MoltenVK rejects with
-    // VK_ERROR_FEATURE_NOT_PRESENT ("Only Metal and host external memory handle
-    // types are supported.").
-    VkExternalMemoryImageCreateInfo extMem{};
-    extMem.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    extMem.pNext = &mtli;
-    extMem.handleTypes = (VkExternalMemoryHandleTypeFlags)0x00020000;
-
+    // Mixing in VkExternalMemoryImageCreateInfo would tell MoltenVK to
+    // expect a separately-imported VkDeviceMemory (via
+    // VkImportMemoryMetalHandleInfoEXT) and made it allocate its own
+    // internal Metal texture instead, so renders never landed in our
+    // IOSurface and Flutter saw a fully black frame even though every
+    // Vulkan call returned VK_SUCCESS.
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.pNext = &extMem;
+    ici.pNext = &mtli;
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = fmt;
     ici.extent = { width, height, 1 };
