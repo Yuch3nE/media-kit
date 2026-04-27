@@ -11,7 +11,6 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private let context: CGLContextObj
   private let textureCache: CVOpenGLTextureCache
   private var renderContext: OpaquePointer?
-  private var screenObserver: NSObjectProtocol?
   private var textureContexts = SwappableObjectManager<TextureGLContext>(
     objects: [],
     skipCheckArgs: true
@@ -30,12 +29,9 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     super.init()
 
     self.initMPV()
-    self.applyDisplayICCProfile()
-    self.startObservingScreenChanges()
   }
 
   deinit {
-    stopObservingScreenChanges()
     disposePixelBuffer()
     disposeMPV()
     OpenGLHelpers.deleteTextureCache(textureCache)
@@ -118,55 +114,6 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     mpv_render_context_set_update_callback(renderContext, nil, nil)
     mpv_render_context_free(renderContext)
-  }
-
-  // Push the current display's ICC profile to the gpu-next backend so the
-  // colour pipeline targets the actual monitor instead of falling back to
-  // generic sRGB. Without this, P3/HDR-capable displays receive incorrect
-  // colour reproduction.
-  private func applyDisplayICCProfile() {
-    guard let renderContext else { return }
-
-    // Tell mpv we are supplying the ICC ourselves; this also keeps the
-    // injected profile from being cleared on the next options update.
-    mpv_set_property_string(handle, "icc-profile-auto", "yes")
-
-    guard let icc = NSScreen.main?.colorSpace?.iccProfileData else {
-      return
-    }
-    let nsData = icc as NSData
-    var byteArray = mpv_byte_array(
-      data: UnsafeMutableRawPointer(mutating: nsData.bytes),
-      size: nsData.length
-    )
-    withUnsafeMutablePointer(to: &byteArray) { ptr in
-      _ = mpv_render_context_set_parameter(
-        renderContext,
-        mpv_render_param(
-          type: MPV_RENDER_PARAM_ICC_PROFILE,
-          data: UnsafeMutableRawPointer(ptr)
-        )
-      )
-    }
-  }
-
-  private func startObservingScreenChanges() {
-    // Re-inject the ICC profile when the screen layout changes (display
-    // hot-plug, resolution change, dragging the window between displays, ...).
-    screenObserver = NotificationCenter.default.addObserver(
-      forName: NSApplication.didChangeScreenParametersNotification,
-      object: nil,
-      queue: .main
-    ) { [weak self] _ in
-      self?.applyDisplayICCProfile()
-    }
-  }
-
-  private func stopObservingScreenChanges() {
-    if let observer = screenObserver {
-      NotificationCenter.default.removeObserver(observer)
-      screenObserver = nil
-    }
   }
 
   public func resize(_ size: CGSize) {
