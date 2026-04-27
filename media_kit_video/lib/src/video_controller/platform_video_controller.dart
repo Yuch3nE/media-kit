@@ -115,6 +115,20 @@ class VideoControllerConfiguration {
   /// Default: `true`
   final bool enableHardwareAcceleration;
 
+  /// Whether to render through the Vulkan path (libmpv `gpu-next` backend over
+  /// MoltenVK) instead of OpenGL on macOS.
+  ///
+  /// When `true`, the macOS plugin tries to bring up a `MoltenVK` device,
+  /// import IOSurface-backed `MTLTexture` slots as `VkImage`, and let mpv's
+  /// `libplacebo` render directly into them. HDR / wide-gamut metadata is
+  /// passed through to the resulting `CVPixelBuffer`.
+  ///
+  /// On any failure (no MoltenVK, missing extensions, etc.) the plugin falls
+  /// back to the OpenGL path silently. Has no effect on non-macOS platforms.
+  ///
+  /// Default: `false`
+  final bool enableVulkanRendering;
+
   /// Whether to attach `android.view.Surface` after video parameters are known.
   ///
   /// Default:
@@ -130,6 +144,7 @@ class VideoControllerConfiguration {
     this.height,
     this.scale = 1.0,
     this.enableHardwareAcceleration = true,
+    this.enableVulkanRendering = false,
     this.androidAttachSurfaceAfterVideoParameters,
   });
 
@@ -141,6 +156,7 @@ class VideoControllerConfiguration {
     int? width,
     int? height,
     bool? enableHardwareAcceleration,
+    bool? enableVulkanRendering,
     bool? androidAttachSurfaceAfterVideoParameters,
   }) =>
       VideoControllerConfiguration(
@@ -151,6 +167,8 @@ class VideoControllerConfiguration {
         height: height ?? this.height,
         enableHardwareAcceleration:
             enableHardwareAcceleration ?? this.enableHardwareAcceleration,
+        enableVulkanRendering:
+            enableVulkanRendering ?? this.enableVulkanRendering,
         androidAttachSurfaceAfterVideoParameters:
             androidAttachSurfaceAfterVideoParameters ??
                 this.androidAttachSurfaceAfterVideoParameters,
