@@ -193,7 +193,10 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             mtlEvent.notify(sharedEventListener, atValue: signalValue) { [weak self] _, _ in
                 guard let self = self else { return }
                 self.slots.pushAsReady(box)
-                self.updateCallback()
+                // FlutterTextureRegistry / updateCallback consumers expect
+                // main-thread invocation; the shared-event listener queue is
+                // a system-provided concurrent queue.
+                DispatchQueue.main.async { self.updateCallback() }
             }
         } else {
             // Blocking fallback: vkQueueWaitIdle on a tiny submission.
