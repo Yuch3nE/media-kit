@@ -125,7 +125,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   // generic sRGB. Without this, P3/HDR-capable displays receive incorrect
   // colour reproduction.
   private func applyDisplayICCProfile() {
-    guard renderContext != nil else { return }
+    guard let renderContext else { return }
 
     // Tell mpv we are supplying the ICC ourselves; this also keeps the
     // injected profile from being cleared on the next options update.
@@ -142,8 +142,10 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     withUnsafeMutablePointer(to: &byteArray) { ptr in
       _ = mpv_render_context_set_parameter(
         renderContext,
-        MPV_RENDER_PARAM_ICC_PROFILE,
-        UnsafeMutableRawPointer(ptr)
+        mpv_render_param(
+          type: MPV_RENDER_PARAM_ICC_PROFILE,
+          data: UnsafeMutableRawPointer(ptr)
+        )
       )
     }
   }
