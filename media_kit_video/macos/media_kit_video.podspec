@@ -31,12 +31,24 @@ Pod::Spec.new do |s|
     # Define paths to frameworks dir
     framework_search_paths_macosx = sprintf('$(PROJECT_DIR)/../Flutter/ephemeral/.symlinks/plugins/%s/macos/Frameworks/.symlinks/mpv/macos', mku.libs_package)
 
-    s.source_files        = 'Classes/plugin/**/*.swift', 'Headers/**/*.h'
+    s.source_files        = 'Classes/plugin/**/*.swift',
+                            '../common/darwin/Classes/plugin/vulkan/*.{h,mm}',
+                            'Headers/**/*.h'
+    s.public_header_files = '../common/darwin/Classes/plugin/vulkan/*.h'
+    s.private_header_files = []
+    s.libraries           = ['c++']
+    s.weak_frameworks     = ['Metal', 'QuartzCore']
     s.pod_target_xcconfig = {
       'DEFINES_MODULE'                      => 'YES',
+      'CLANG_ENABLE_MODULES'                => 'YES',
       'GCC_WARN_INHIBIT_ALL_WARNINGS'       => 'YES',
-      'GCC_PREPROCESSOR_DEFINITIONS'        => '"$(inherited)" GL_SILENCE_DEPRECATION COREVIDEO_SILENCE_GL_DEPRECATION',
+      'GCC_PREPROCESSOR_DEFINITIONS'        => '"$(inherited)" GL_SILENCE_DEPRECATION COREVIDEO_SILENCE_GL_DEPRECATION VK_USE_PLATFORM_METAL_EXT=1',
       'FRAMEWORK_SEARCH_PATHS[sdk=macosx*]' => sprintf('"$(inherited)" "%s"', framework_search_paths_macosx),
+      # MoltenVK / Vulkan loader headers + libs are expected from Homebrew or
+      # an env-provided SDK. Allow override via the VULKAN_SDK_PREFIX user
+      # build setting; otherwise probe common Homebrew locations.
+      'HEADER_SEARCH_PATHS'                 => '"$(inherited)" "$(VULKAN_SDK_PREFIX)/include" "/opt/homebrew/include" "/usr/local/include"',
+      'LIBRARY_SEARCH_PATHS'                => '"$(inherited)" "$(VULKAN_SDK_PREFIX)/lib" "/opt/homebrew/lib" "/usr/local/lib"',
       'OTHER_LDFLAGS'                       => '"$(inherited)" -framework Mpv',
     }
   else

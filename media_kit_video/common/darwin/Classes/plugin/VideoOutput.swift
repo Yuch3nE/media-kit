@@ -26,6 +26,7 @@ public class VideoOutput: NSObject {
 
   private let handle: OpaquePointer
   private let enableHardwareAcceleration: Bool
+  private let enableVulkanRendering: Bool
   private let registry: FlutterTextureRegistry
   private let textureUpdateCallback: TextureUpdateCallback
   private let worker: Worker = .init()
@@ -49,6 +50,7 @@ public class VideoOutput: NSObject {
     width = configuration.width
     height = configuration.height
     enableHardwareAcceleration = configuration.enableHardwareAcceleration
+    enableVulkanRendering = configuration.enableVulkanRendering
     self.registry = registry
     self.textureUpdateCallback = textureUpdateCallback
 
@@ -88,18 +90,37 @@ public class VideoOutput: NSObject {
     }
 
     if enableHardwareAcceleration {
-      texture = SafeResizableTexture(
-        TextureHW(
+      // Optional Vulkan path (macOS only for now). Falls back to OpenGL HW
+      // path if the Vulkan context fails to initialize (no MoltenVK, mpv
+      // built without -Dvulkan, etc.).
+      #if os(macOS)
+      if enableVulkanRendering {
+        if let vk = TextureVK(
           handle: handle,
-          // Use `weak self` to prevent memory leaks
-          updateCallback: { [weak self]() in
-            guard let that = self else {
-              return
+          updateCallback: { [weak self] in self?.updateCallback() }
+        ) {
+          texture = SafeResizableTexture(vk)
+          NSLog("VideoOutput: using Vulkan/MoltenVK render path")
+        } else {
+          NSLog("VideoOutput: Vulkan path requested but unavailable; falling back to OpenGL")
+        }
+      }
+      #endif
+
+      if texture == nil {
+        texture = SafeResizableTexture(
+          TextureHW(
+            handle: handle,
+            // Use `weak self` to prevent memory leaks
+            updateCallback: { [weak self]() in
+              guard let that = self else {
+                return
+              }
+              that.updateCallback()
             }
-            that.updateCallback()
-          }
+          )
         )
-      )
+      }
     } else {
       texture = SafeResizableTexture(
         TextureSW(
