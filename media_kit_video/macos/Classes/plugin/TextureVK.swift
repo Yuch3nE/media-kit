@@ -474,6 +474,30 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
                               kCVImageBufferYCbCrMatrix_ITU_R_709_2,
                               .shouldPropagate)
+
+        // HDR static metadata: required by Core Animation EDR path. We
+        // encode H.265 SEI-style blobs and attach them only when mpv tells
+        // us the frame is actually HDR (PQ/HLG transfer with non-zero
+        // luminance), otherwise SDR clips would carry stale HDR hints.
+        let isHDR = (transfer == "pq" || transfer == "hlg") &&
+                    (hint.max_luma > 0)
+        if isHDR {
+            if let mdcv = TextureVK.makeMasteringDisplayCVData(
+                primaries: primaries,
+                minLuma: hint.min_luma,
+                maxLuma: hint.max_luma) {
+                CVBufferSetAttachment(pb,
+                    kCVImageBufferMasteringDisplayColorVolumeKey,
+                    mdcv, .shouldPropagate)
+            }
+            if hint.max_cll > 0 || hint.max_fall > 0 {
+                let cll = TextureVK.makeContentLightLevelCVData(
+                    maxCLL: hint.max_cll, maxFALL: hint.max_fall)
+                CVBufferSetAttachment(pb,
+                    kCVImageBufferContentLightLevelInfoKey,
+                    cll, .shouldPropagate)
+            }
+        }
     }
 
     private static func cvPrimaries(forName name: String) -> CFString? {
@@ -504,6 +528,103 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             return kCVImageBufferTransferFunction_UseGamma
         default:
             return nil
+        }
+    }
+
+    // CIE xy chromaticities per primaries spec. (x, y) for R, G, B, then white
+    // point. Values match libplacebo's pl_raw_primaries_get / ITU specs.
+    private static func chromaticities(forName name: String)
+        -> (rx: Double, ry: Double, gx: Double, gy: Double,
+            bx: Double, by: Double, wx: Double, wy: Double)?
+    {
+        switch name {
+        case "bt.709":
+            return (0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290)
+        case "display-p3":
+            return (0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290)
+        case "bt.2020":
+            return (0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290)
+        case "smpte-431", "dci-p3":
+            return (0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3140, 0.3510)
+        default:
+            return nil
+        }
+    }
+
+    // H.265 mastering_display_colour_volume SEI payload, big-endian, 24 bytes:
+    //   display_primaries_x[3] (G,B,R) uint16, units of 0.00002
+    //   display_primaries_y[3] (G,B,R) uint16, units of 0.00002
+    //   white_point_x          uint16, units of 0.00002
+    //   white_point_y          uint16, units of 0.00002
+    //   max_display_mastering_luminance uint32, units of 0.0001 cd/m^2
+    //   min_display_mastering_luminance uint32, units of 0.0001 cd/m^2
+    // This is the exact byte layout that
+    // kCVImageBufferMasteringDisplayColorVolumeKey expects on Apple platforms.
+    private static func makeMasteringDisplayCVData(primaries: String,
+                                                   minLuma: Float,
+                                                   maxLuma: Float) -> CFData?
+    {
+        guard let xy = chromaticities(forName: primaries) else { return nil }
+
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(24)
+
+        func appendU16BE(_ v: UInt16) {
+            bytes.append(UInt8(v >> 8))
+            bytes.append(UInt8(v & 0xFF))
+        }
+        func appendU32BE(_ v: UInt32) {
+            bytes.append(UInt8((v >> 24) & 0xFF))
+            bytes.append(UInt8((v >> 16) & 0xFF))
+            bytes.append(UInt8((v >> 8) & 0xFF))
+            bytes.append(UInt8(v & 0xFF))
+        }
+        func toUnit(_ v: Double) -> UInt16 {
+            let scaled = (v / 0.00002).rounded()
+            return UInt16(max(0, min(scaled, Double(UInt16.max))))
+        }
+        func toLumaUnit(_ v: Float) -> UInt32 {
+            let scaled = Double(v) / 0.0001
+            return UInt32(max(0, min(scaled.rounded(), Double(UInt32.max))))
+        }
+
+        // Order is G, B, R per spec.
+        appendU16BE(toUnit(xy.gx))
+        appendU16BE(toUnit(xy.bx))
+        appendU16BE(toUnit(xy.rx))
+        appendU16BE(toUnit(xy.gy))
+        appendU16BE(toUnit(xy.by))
+        appendU16BE(toUnit(xy.ry))
+        appendU16BE(toUnit(xy.wx))
+        appendU16BE(toUnit(xy.wy))
+        appendU32BE(toLumaUnit(maxLuma))
+        appendU32BE(toLumaUnit(minLuma))
+
+        return bytes.withUnsafeBufferPointer { buf in
+            CFDataCreate(kCFAllocatorDefault, buf.baseAddress, buf.count)
+        }
+    }
+
+    // H.265 content_light_level_info SEI payload, big-endian, 4 bytes:
+    //   max_content_light_level     uint16 (cd/m^2)
+    //   max_pic_average_light_level uint16 (cd/m^2)
+    private static func makeContentLightLevelCVData(maxCLL: Float,
+                                                    maxFALL: Float) -> CFData
+    {
+        func clamp16(_ v: Float) -> UInt16 {
+            let r = v.rounded()
+            if r <= 0 { return 0 }
+            if r >= Float(UInt16.max) { return UInt16.max }
+            return UInt16(r)
+        }
+        let cll  = clamp16(maxCLL)
+        let fall = clamp16(maxFALL)
+        let bytes: [UInt8] = [
+            UInt8(cll  >> 8), UInt8(cll  & 0xFF),
+            UInt8(fall >> 8), UInt8(fall & 0xFF),
+        ]
+        return bytes.withUnsafeBufferPointer { buf in
+            CFDataCreate(kCFAllocatorDefault, buf.baseAddress, buf.count)!
         }
     }
 }
