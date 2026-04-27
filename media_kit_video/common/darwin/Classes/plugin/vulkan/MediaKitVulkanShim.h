@@ -99,6 +99,12 @@ bool mk_vk_supports_metal_event_sync(MKVulkanContext *ctx);
 // MTLSharedEvent so Metal can wait async on its own queue.
 void mk_vk_wait_semaphore_blocking(MKVulkanContext *ctx, uint64_t semaphore);
 
+// Strongest possible wait: vkDeviceWaitIdle on the imported device. Use this
+// after a Metal-interop render to guarantee MoltenVK has fully flushed all
+// pending command buffers (including the implicit ownership-release barrier)
+// before Metal samples the underlying MTLTexture.
+void mk_vk_wait_device_idle(MKVulkanContext *ctx);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

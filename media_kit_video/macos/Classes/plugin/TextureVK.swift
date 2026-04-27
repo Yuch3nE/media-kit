@@ -142,7 +142,8 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     }
 
     public func render(_ size: CGSize) {
-        guard let rc = renderContext, let box = slots.nextAvailable() else { return }
+        guard let rc = renderContext else { return }
+        guard let box = slots.nextAvailable() else { return }
 
         // Pick a fresh signal value for timeline mode; binary mode uses 0.
         var signalValue: UInt64 = 0
@@ -157,21 +158,24 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         image.height          = box.inner.height
         image.format          = box.inner.format
         image.usage           = box.inner.usage
-        // VK_IMAGE_ASPECT_COLOR_BIT = 0x1. Spec allows 0 here, but at least
-        // some libplacebo paths fast-path on a non-zero aspect mask, so be
-        // explicit.
+        // VK_IMAGE_ASPECT_COLOR_BIT.
         image.aspect          = 0x1
+        // The image was last touched by Metal -> tell mpv to acquire it from
+        // the EXTERNAL queue family on entry. We DO NOT also use UNDEFINED
+        // here, but we keep using UNDEFINED layout so mpv knows it can
+        // discard previous Vulkan-side contents (Metal owns the storage).
+        // 'in_qf' must be EXTERNAL too; using IGNORED here makes MoltenVK
+        // skip the acquire barrier and the imported MTLTexture stays in an
+        // undefined state for Vulkan, which is what produced the all-zero
+        // BGRA pixels we observed.
         image.in_layout       = 0  // VK_IMAGE_LAYOUT_UNDEFINED
-        // VK_QUEUE_FAMILY_EXTERNAL = (~0u - 1) = 0xFFFFFFFE.
-        // The image is backed by an MTLTexture (a non-Vulkan API), so per
-        // render_vk.h we must mark both the inbound and outbound queue
-        // family as EXTERNAL. Without this, MoltenVK does not emit the
-        // ownership-release barrier and the rendered contents never get
-        // flushed back into the underlying IOSurface -> black frame in
-        // Flutter even though every Vulkan call returns success.
-        image.in_qf           = 0xFFFFFFFE
+        image.in_qf           = 0xFFFFFFFE  // VK_QUEUE_FAMILY_EXTERNAL
+        // Hand the image back in SHADER_READ_ONLY_OPTIMAL layout. mpv issues
+        // a final blit/dither pass that targets this layout; using GENERAL
+        // here was a guess that didn't help and may interact poorly with
+        // libplacebo's color-conversion pipeline.
         image.out_layout      = 5  // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        image.out_qf          = 0xFFFFFFFE
+        image.out_qf          = 0xFFFFFFFE  // VK_QUEUE_FAMILY_EXTERNAL
         image.wait_semaphore  = 0
         image.wait_value      = 0
         image.signal_semaphore = box.inner.vkSemaphore
@@ -209,7 +213,10 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             }
         }
 
-        applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
+        // NOTE: gpu_next_get_colorspace_hint crashes inside mpv on this build,
+        // mirroring a known Windows issue. Disable the hint round-trip until
+        // upstream stabilises it; SDR / Rec.709 fallback is acceptable.
+        // applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
 
         if let mtlEvent = box.inner.mtlEvent {
             // Async path: register a listener that fires when the GPU has
@@ -227,18 +234,32 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
                 DispatchQueue.main.async { self.updateCallback() }
             }
         } else {
-            // Blocking fallback: vkQueueWaitIdle on a tiny submission.
-            mk_vk_wait_semaphore_blocking(vkContext, box.inner.vkSemaphore)
+            // Blocking fallback: full device wait so MoltenVK guarantees the
+            // imported MTLTexture is fully flushed before Metal samples it.
+            mk_vk_wait_device_idle(vkContext)
+            // Force MTLTexture coherency from the Metal side: do a no-op
+            // blit followed by waitUntilCompleted. On AGX (M-series) this
+            // is what makes IOSurface contents visible to subsequent
+            // CoreAnimation samplers when the producer was Vulkan/MoltenVK.
+            metalSyncTexture(box.inner.mtlTexture)
             slots.pushAsReady(box)
-            if !firstFramePublished {
-                firstFramePublished = true
-                NSLog("TextureVK: first frame published (\(box.inner.width)x\(box.inner.height), fmt=\(box.inner.format)).")
-            }
         }
     }
 
+    private lazy var metalCommandQueue: MTLCommandQueue? = mtlDevice.makeCommandQueue()
+
+    private func metalSyncTexture(_ tex: MTLTexture) {
+        guard let q = metalCommandQueue,
+              let cb = q.makeCommandBuffer(),
+              let blit = cb.makeBlitCommandEncoder() else { return }
+        // synchronize(resource:) is a no-op on .shared storage but ensures
+        // the GPU completes any outstanding work touching the texture.
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()
+    }
+
     private var lastRenderFailLogAt: TimeInterval = 0
-    private var firstFramePublished: Bool = false
 
     // MARK: internals
 
@@ -452,7 +473,8 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         hostSurfaceMaxLuma   = maxLuma
         hostSurfaceMinLuma   = minLuma
 
-        publishTargetStateToMPV()
+        // Disabled: see note in render() above.
+        // publishTargetStateToMPV()
     }
 
     // Push the current host surface description into mpv proactively (not

@@ -572,9 +572,19 @@ MKVulkanImage *mk_vk_image_import_mtl(MKVulkanContext *c,
     mtli.plane = VK_IMAGE_ASPECT_COLOR_BIT;
     mtli.mtlTexture = mtl_texture;
 
+    // VkExternalMemoryImageCreateInfo MUST be in the pNext chain to tell
+    // MoltenVK this image's storage comes from outside Vulkan. Without it
+    // MoltenVK silently allocates its own MTLTexture and renders there
+    // instead of the imported one (= guaranteed black pixels for the host).
+    // VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT = 0x00000400.
+    VkExternalMemoryImageCreateInfo extMem{};
+    extMem.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    extMem.pNext = &mtli;
+    extMem.handleTypes = (VkExternalMemoryHandleTypeFlags)0x00000400;
+
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    ici.pNext = &mtli;
+    ici.pNext = &extMem;
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = fmt;
     ici.extent = { width, height, 1 };
@@ -634,6 +644,12 @@ void mk_vk_wait_semaphore_blocking(MKVulkanContext *c, uint64_t sem) {
     // submission, which can stall indefinitely on MoltenVK.
     std::lock_guard<std::mutex> lk(c->queue_mutex);
     c->vkQueueWaitIdle(c->queue);
+}
+
+void mk_vk_wait_device_idle(MKVulkanContext *c) {
+    if (!c || !c->device || !c->vkDeviceWaitIdle) return;
+    std::lock_guard<std::mutex> lk(c->queue_mutex);
+    c->vkDeviceWaitIdle(c->device);
 }
 
 bool mk_vk_supports_metal_event_sync(MKVulkanContext *c) {

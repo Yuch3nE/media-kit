@@ -93,7 +93,7 @@ public class VideoOutput: NSObject {
       // Optional Vulkan path (macOS only for now). Falls back to OpenGL HW
       // path if the Vulkan context fails to initialize (no MoltenVK, mpv
       // built without -Dvulkan, etc.).
-      #if os(macOS)
+      #if os(macOS) && MEDIA_KIT_ENABLE_VULKAN
       if enableVulkanRendering {
         if let vk = TextureVK(
           handle: handle,
@@ -104,6 +104,10 @@ public class VideoOutput: NSObject {
         } else {
           NSLog("VideoOutput: Vulkan path requested but unavailable; falling back to OpenGL")
         }
+      }
+      #elseif os(macOS)
+      if enableVulkanRendering {
+        NSLog("VideoOutput: Vulkan path requested but this build excludes Vulkan support; falling back to OpenGL")
       }
       #endif
 
