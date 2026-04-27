@@ -35,10 +35,7 @@ abstract class PlatformVideoController {
   final ValueNotifier<Rect?> rect = ValueNotifier<Rect?>(null);
 
   /// {@macro platform_video_controller}
-  PlatformVideoController(
-    this.player,
-    this.configuration,
-  );
+  PlatformVideoController(this.player, this.configuration);
 
   /// Sets the required size of the video output.
   /// This may yield substantial performance improvements if a small [width] & [height] is specified.
@@ -46,10 +43,7 @@ abstract class PlatformVideoController {
   /// Remember:
   /// * “Premature optimization is the root of all evil”
   /// * “With great power comes great responsibility”
-  Future<void> setSize({
-    int? width,
-    int? height,
-  });
+  Future<void> setSize({int? width, int? height});
 
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
@@ -158,19 +152,17 @@ class VideoControllerConfiguration {
     bool? enableHardwareAcceleration,
     bool? enableVulkanRendering,
     bool? androidAttachSurfaceAfterVideoParameters,
-  }) =>
-      VideoControllerConfiguration(
-        vo: vo ?? this.vo,
-        hwdec: hwdec ?? this.hwdec,
-        scale: scale ?? this.scale,
-        width: width ?? this.width,
-        height: height ?? this.height,
-        enableHardwareAcceleration:
-            enableHardwareAcceleration ?? this.enableHardwareAcceleration,
-        enableVulkanRendering:
-            enableVulkanRendering ?? this.enableVulkanRendering,
-        androidAttachSurfaceAfterVideoParameters:
-            androidAttachSurfaceAfterVideoParameters ??
-                this.androidAttachSurfaceAfterVideoParameters,
-      );
+  }) => VideoControllerConfiguration(
+    vo: vo ?? this.vo,
+    hwdec: hwdec ?? this.hwdec,
+    scale: scale ?? this.scale,
+    width: width ?? this.width,
+    height: height ?? this.height,
+    enableHardwareAcceleration:
+        enableHardwareAcceleration ?? this.enableHardwareAcceleration,
+    enableVulkanRendering: enableVulkanRendering ?? this.enableVulkanRendering,
+    androidAttachSurfaceAfterVideoParameters:
+        androidAttachSurfaceAfterVideoParameters ??
+        this.androidAttachSurfaceAfterVideoParameters,
+  );
 }
