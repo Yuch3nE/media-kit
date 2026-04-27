@@ -72,6 +72,13 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
     private var hostSurfaceMaxLuma:   Float  = 0.0  // 0 = unknown
     private var hostSurfaceMinLuma:   Float  = 0.0
     private var screenObserver: NSObjectProtocol?
+    // Guard for mpv_render_context_get_info(VK_COLORSPACE_HINT): the hint
+    // path on mpv side dereferences ctx->next_frame, which is NULL until at
+    // least one frame has been submitted via mpv_render_context_render().
+    // Querying earlier (or right after render() consumes next_frame) crashes
+    // inside gpu_next_get_colorspace_hint. We only call get_info when we are
+    // absolutely sure mpv has produced a current frame to inspect.
+    private var havePresentedFrame: Bool = false
 
     // Wraps Slot in a class so SwappableObjectManager (which expects AnyObject)
     // can hold it.
@@ -213,10 +220,17 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
             }
         }
 
-        // NOTE: gpu_next_get_colorspace_hint crashes inside mpv on this build,
-        // mirroring a known Windows issue. Disable the hint round-trip until
-        // upstream stabilises it; SDR / Rec.709 fallback is acceptable.
-        // applyColorspaceHintToPixelBuffer(box.inner.pixelBuffer)
+        // gpu_next_get_colorspace_hint dereferences ctx->next_frame inside
+        // mpv. mpv_render_context_render() above just NULL'd next_frame, so
+        // querying immediately after render still segfaults. Apply CV color
+        // attachments using our host-side surface description instead, which
+        // mpv already received via mpv_vulkan_image.surface_* in the render
+        // call (see render_vk.h: target state is set both via VK_TARGET_STATE
+        // and inline on every render). This skips the unsafe round-trip.
+        if renderRc >= 0 {
+            havePresentedFrame = true
+            applyHostColorspaceToPixelBuffer(box.inner.pixelBuffer)
+        }
 
         if let mtlEvent = box.inner.mtlEvent {
             // Async path: register a listener that fires when the GPU has
@@ -473,8 +487,11 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         hostSurfaceMaxLuma   = maxLuma
         hostSurfaceMinLuma   = minLuma
 
-        // Disabled: see note in render() above.
-        // publishTargetStateToMPV()
+        // Push to mpv eagerly. set_parameter(VK_TARGET_STATE) only writes the
+        // shared color description and never touches frame state, so it is
+        // safe to call at any point in the render context lifecycle (unlike
+        // get_info(VK_COLORSPACE_HINT)).
+        publishTargetStateToMPV()
     }
 
     // Push the current host surface description into mpv proactively (not
@@ -499,12 +516,50 @@ public final class TextureVK: NSObject, FlutterTexture, ResizableTextureProtocol
         }
     }
 
+    // Apply CV color attachments based on the host surface description we
+    // already pushed into mpv via mpv_vulkan_image.surface_* / VK_TARGET_STATE.
+    // This is the mpv-free counterpart of applyColorspaceHintToPixelBuffer():
+    // it does not call mpv_render_context_get_info, so it cannot crash in
+    // gpu_next_get_colorspace_hint when the next_frame slot is empty.
+    private func applyHostColorspaceToPixelBuffer(_ pb: CVPixelBuffer) {
+        if let cvPrim = TextureVK.cvPrimaries(forName: hostSurfacePrimaries) {
+            CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
+                                  cvPrim, .shouldPropagate)
+        }
+        if let cvTrc = TextureVK.cvTransfer(forName: hostSurfaceTransfer) {
+            CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey,
+                                  cvTrc, .shouldPropagate)
+        }
+        CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                              .shouldPropagate)
+
+        let isHDR = (hostSurfaceTransfer == "pq" || hostSurfaceTransfer == "hlg") &&
+                    hostSurfaceMaxLuma > 0
+        if isHDR {
+            if let mdcv = TextureVK.makeMasteringDisplayCVData(
+                primaries: hostSurfacePrimaries,
+                minLuma: hostSurfaceMinLuma,
+                maxLuma: hostSurfaceMaxLuma) {
+                CVBufferSetAttachment(pb,
+                    kCVImageBufferMasteringDisplayColorVolumeKey,
+                    mdcv, .shouldPropagate)
+            }
+        }
+    }
+
     // After each frame, ask mpv which colorspace it actually wrote and stamp
     // matching CV attachments onto the pixel buffer Flutter will sample.
     // Without this, Core Animation defaults to assuming sRGB and HDR / wide
     // gamut frames render with wrong colors.
+    //
+    // IMPORTANT: only call when havePresentedFrame is true. Inside mpv,
+    // gpu_next_get_colorspace_hint dereferences ctx->next_frame which is
+    // set NULL by mpv_render_context_render right after consuming a frame,
+    // so this path is currently only safe to invoke between renders, never
+    // inline with one. Kept available for future when mpv side is hardened.
     private func applyColorspaceHintToPixelBuffer(_ pb: CVPixelBuffer) {
-        guard let rc = renderContext else { return }
+        guard havePresentedFrame, let rc = renderContext else { return }
 
         var hint = mpv_vulkan_colorspace_hint()
         let rcv = withUnsafeMutablePointer(to: &hint) { hp -> Int32 in
