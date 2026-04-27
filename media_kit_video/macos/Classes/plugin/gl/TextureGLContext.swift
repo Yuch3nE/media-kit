@@ -1,6 +1,5 @@
 public class TextureGLContext {
   private let context: CGLContextObj
-  private let renderBuffer: GLuint
   public let frameBuffer: GLuint
   public let texture: CVOpenGLTexture
   public let pixelBuffer: CVPixelBuffer
@@ -19,14 +18,8 @@ public class TextureGLContext {
       pixelBuffer
     )
 
-    self.renderBuffer = OpenGLHelpers.createRenderBuffer(
-      context,
-      size
-    )
-
     self.frameBuffer = OpenGLHelpers.createFrameBuffer(
       context: context,
-      renderBuffer: renderBuffer,
       texture: texture,
       size: size
     )
@@ -35,7 +28,6 @@ public class TextureGLContext {
   deinit {
     OpenGLHelpers.deletePixeBuffer(context, pixelBuffer)
     OpenGLHelpers.deleteTexture(context, texture)
-    OpenGLHelpers.deleteRenderBuffer(context, renderBuffer)
     OpenGLHelpers.deleteFrameBuffer(context, frameBuffer)
   }
 }

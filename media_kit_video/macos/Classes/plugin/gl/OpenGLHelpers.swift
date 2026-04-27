@@ -100,36 +100,8 @@ public class OpenGLHelpers {
     return texture!
   }
 
-  static public func createRenderBuffer(
-    _ context: CGLContextObj,
-    _ size: CGSize
-  ) -> GLuint {
-    CGLSetCurrentContext(context)
-    defer {
-      OpenGLHelpers.checkError("createRenderBuffer")
-      CGLSetCurrentContext(nil)
-    }
-
-    var renderBuffer: GLuint = GLuint()
-    glGenRenderbuffers(1, &renderBuffer)
-    glBindRenderbuffer(GLenum(GL_RENDERBUFFER), renderBuffer)
-    defer {
-      glBindRenderbuffer(GLenum(GL_RENDERBUFFER), 0)
-    }
-
-    glRenderbufferStorage(
-      GLenum(GL_RENDERBUFFER),
-      GLenum(GL_DEPTH24_STENCIL8),
-      GLsizei(size.width),
-      GLsizei(size.height)
-    )
-
-    return renderBuffer
-  }
-
   static public func createFrameBuffer(
     context: CGLContextObj,
-    renderBuffer: GLuint,
     texture: CVOpenGLTexture,
     size: CGSize
   ) -> GLuint {
@@ -165,19 +137,13 @@ public class OpenGLHelpers {
       glBindFramebuffer(GLenum(GL_FRAMEBUFFER), 0)
     }
 
+    // mpv only writes color; no depth/stencil attachment is needed.
     glFramebufferTexture2D(
       GLenum(GL_FRAMEBUFFER),
       GLenum(GL_COLOR_ATTACHMENT0),
       GLenum(GL_TEXTURE_RECTANGLE),
       textureName,
       0
-    )
-
-    glFramebufferRenderbuffer(
-      GLenum(GL_FRAMEBUFFER),
-      GLenum(GL_DEPTH_ATTACHMENT),
-      GLenum(GL_RENDERBUFFER),
-      renderBuffer
     )
 
     return frameBuffer
@@ -223,20 +189,6 @@ public class OpenGLHelpers {
 
     var textureName: GLuint = CVOpenGLTextureGetName(texture)
     glDeleteTextures(1, &textureName)
-  }
-
-  static public func deleteRenderBuffer(
-    _ context: CGLContextObj,
-    _ renderBuffer: GLuint
-  ) {
-    CGLSetCurrentContext(context)
-    defer {
-      OpenGLHelpers.checkError("deleteRenderBuffer")
-      CGLSetCurrentContext(nil)
-    }
-
-    var renderBuffer = renderBuffer
-    glDeleteRenderbuffers(1, &renderBuffer)
   }
 
   static public func deleteFrameBuffer(
