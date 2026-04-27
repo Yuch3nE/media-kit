@@ -76,6 +76,35 @@ public class OpenGLHelpers {
     )
     assert(cvret == kCVReturnSuccess, "CVPixelBufferCreate")
 
+    if let pixelBuffer,
+      let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+    {
+      CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferCGColorSpaceKey,
+        colorSpace,
+        .shouldPropagate
+      )
+      CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferColorPrimariesKey,
+        kCVImageBufferColorPrimaries_ITU_R_709_2,
+        .shouldPropagate
+      )
+      CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferTransferFunctionKey,
+        kCVImageBufferTransferFunction_sRGB,
+        .shouldPropagate
+      )
+      CVBufferSetAttachment(
+        pixelBuffer,
+        kCVImageBufferYCbCrMatrixKey,
+        kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+        .shouldPropagate
+      )
+    }
+
     return pixelBuffer!
   }
 

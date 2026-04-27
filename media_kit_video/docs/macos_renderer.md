@@ -40,6 +40,8 @@ triple buffer 仍可流水化（fence 落在不同 slot 上，互不阻塞），
 
 因此当前实现不再调用 `MPV_RENDER_PARAM_ICC_PROFILE`，也不在该路径上启用 `icc-profile-auto`。如果后续要恢复精确的宽色域输出，前提是先让宿主纹理携带正确的 colorspace 元数据，或改成能显式表达目标色域的渲染链路。
 
+另外，OpenGL 路径现在会在每个输出 `CVPixelBuffer` 上显式附加 sRGB / BT.709 的 CoreVideo 色彩元数据，避免未标记的 BGRA `IOSurface` 被 CoreAnimation 按不一致的默认色域解释，导致 SDR 内容尤其是字幕边缘发灰。
+
 ## 已知遗留
 
 - **fp16 / 8-bit 不匹配**：`createPixelFormat()` 用 `kCGLPFAColorSize=64 + kCGLPFAColorFloat`，但 IOSurface 一直是 `kCVPixelFormatType_32BGRA`。FBO 内部 fp16 ↔ 8-bit 输出做了无谓转换；HDR / 10-bit 内容仍被截断到 8-bit。要真正利用 gpu-next 的 HDR tone-mapping，需把上层 API 扩展为可选 `kCVPixelFormatType_64RGBAHalf` 等，并验证 Flutter macOS embedder 接受 fp16 像素格式。
